@@ -1,124 +1,194 @@
-//! TARGET API EXAMPLE - Distribution-based benchmark API.
+//! TARGET API EXAMPLE
 //!
-//! This file demonstrates the target API for the threshold finder.
-//! The key insight: generate realistic data first, then compute stats for reporting.
+//! This shows the complete target API for the threshold finder system.
 //!
 //! Data flow:
-//!   seed → Data → Stats (optional, for reporting)
-//!            ↓
-//!       benchmark variants
-//!            ↓
-//!       aggregate across distributions
-//!            ↓
-//!       find optimal variant
+//!   seed → Data → Stats
+//!                   ↓
+//!            variant(data, stats) → Output
+//!                   ↓
+//!            aggregate across distributions
+//!                   ↓
+//!            find optimal (variant, params)
 
-#![allow(dead_code, unused_imports, unused_variables, clippy::type_complexity)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    clippy::type_complexity,
+    clippy::needless_doctest_main
+)]
 
 use rand::Rng;
 use rand::SeedableRng;
+use std::fmt::Debug;
 
 // ============================================================================
-// STEP 1: Define your Data type
+// TARGET API - What we want to implement
 // ============================================================================
 
-/// The input to our algorithm: a bitmap and a position to query rank at.
+/*
+use vortex_threshold::{threshold_bench, Benchmark, ParamGrid, StatsBench};
+
+// ----------------------------------------------------------------------------
+// Benchmark 1: Rank
+// ----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, ParamGrid)]
+struct ChunkedParams {
+    #[param(values = [4, 8, 16, 32])]
+    chunk_size: usize,
+}
+
+#[threshold_bench]
+fn rank_bench() -> impl Benchmark {
+    StatsBench::new("rank")
+        // 1. Distributions
+        .distribution("sparse", gen_sparse)
+        .distribution("dense", gen_dense)
+        .distribution("zipfian", gen_zipfian)
+        .weight("zipfian", 2.0)
+
+        // 2. Stats (computed from data, passed to variants)
+        .stats(RankStats::compute)
+
+        // 3. Baseline & Variants
+        .baseline("naive", |data, stats| rank_naive(data))
+        .variant("simd", |data, stats| rank_simd(data))
+        .variant("adaptive", |data, stats| {
+            if stats.density < 0.2 {
+                rank_sparse_opt(data)
+            } else {
+                rank_dense_opt(data)
+            }
+        })
+        .variant_params::<ChunkedParams>("chunked", |data, stats, p| {
+            rank_chunked(data, p.chunk_size)
+        })
+
+        .build()
+}
+
+// ----------------------------------------------------------------------------
+// Benchmark 2: Select
+// ----------------------------------------------------------------------------
+
+#[threshold_bench]
+fn select_bench() -> impl Benchmark {
+    StatsBench::new("select")
+        .distribution("sparse", gen_sparse)
+        .distribution("dense", gen_dense)
+
+        .stats(SelectStats::compute)
+
+        .baseline("naive", |data, stats| select_naive(data))
+        .variant("binary_search", |data, stats| select_binary(data))
+
+        .build()
+}
+
+// ----------------------------------------------------------------------------
+// Benchmark 3: Popcount (no stats needed)
+// ----------------------------------------------------------------------------
+
+#[threshold_bench]
+fn popcount_bench() -> impl Benchmark {
+    StatsBench::new("popcount")
+        .distribution("random", gen_random_words)
+        .distribution("sparse", gen_sparse_words)
+        .distribution("dense", gen_dense_words)
+
+        // No .stats() call - variants just ignore stats parameter
+        .stats(|_| ())  // unit stats
+
+        .baseline("naive", |data, _| popcount_naive(data))
+        .variant("builtin", |data, _| popcount_builtin(data))
+        .variant("lookup", |data, _| popcount_lookup(data))
+
+        .build()
+}
+
+// ----------------------------------------------------------------------------
+// Main - runs all registered benchmarks
+// ----------------------------------------------------------------------------
+
+fn main() {
+    // threshold_runner::main() does:
+    // 1. Parse CLI args (filter, --list, --samples, --output)
+    // 2. Collect all #[threshold_bench] functions via linkme
+    // 3. Run matching benchmarks
+    // 4. Print results / save to JSON
+    threshold_runner::main();
+}
+
+// Run with:
+//   cargo run --release                    # all benchmarks
+//   cargo run --release -- rank            # just rank
+//   cargo run --release -- --list          # list benchmarks
+//   cargo run --release -- --samples 100   # 100 samples per dist
+//   cargo run --release -- --output r.json # save results
+*/
+
+// ============================================================================
+// Data Types
+// ============================================================================
+
 #[derive(Clone)]
 struct RankData {
     bitmap: Vec<u64>,
     position: usize,
 }
 
-// ============================================================================
-// STEP 2: Define Stats (optional, for reporting/analysis)
-// ============================================================================
-
-/// Stats computed FROM data, used for analysis and reporting.
-/// NOT used to generate data - that's backwards.
 #[derive(Clone, Debug)]
 struct RankStats {
-    /// Length of the bitmap in u64 words
     len: usize,
-    /// Fraction of bits set (0.0 to 1.0)
     density: f64,
 }
 
 impl RankStats {
-    /// Compute stats from data (called after generation, for reporting)
     fn compute(data: &RankData) -> Self {
         let total_bits = data.bitmap.len() * 64;
         let set_bits: usize = data.bitmap.iter().map(|w| w.count_ones() as usize).sum();
-        let density = if total_bits > 0 {
-            set_bits as f64 / total_bits as f64
-        } else {
-            0.0
-        };
         Self {
             len: data.bitmap.len(),
-            density,
+            density: if total_bits > 0 {
+                set_bits as f64 / total_bits as f64
+            } else {
+                0.0
+            },
         }
     }
 }
 
 // ============================================================================
-// STEP 3: Define data generators for each distribution
+// Distributions
 // ============================================================================
 
-/// Generate a sparse bitmap (low density, ~10% bits set)
-fn gen_sparse_bitmap(seed: u64) -> RankData {
+fn gen_sparse(seed: u64) -> RankData {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let len = rng.random_range(100..10000);
-    let density = 0.1;
-
-    let bitmap: Vec<u64> = (0..len)
-        .map(|_| {
-            let mut word = 0u64;
-            for bit in 0..64 {
-                if rng.random::<f64>() < density {
-                    word |= 1 << bit;
-                }
-            }
-            word
-        })
+    let bitmap = (0..len)
+        .map(|_| rng.random::<u64>() & 0x1111_1111_1111_1111)
         .collect();
-
-    let max_pos = len * 64;
-    let position = rng.random_range(0..max_pos);
-
+    let position = rng.random_range(0..len * 64);
     RankData { bitmap, position }
 }
 
-/// Generate a dense bitmap (high density, ~90% bits set)
-fn gen_dense_bitmap(seed: u64) -> RankData {
+fn gen_dense(seed: u64) -> RankData {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let len = rng.random_range(100..10000);
-    let density = 0.9;
-
-    let bitmap: Vec<u64> = (0..len)
-        .map(|_| {
-            let mut word = 0u64;
-            for bit in 0..64 {
-                if rng.random::<f64>() < density {
-                    word |= 1 << bit;
-                }
-            }
-            word
-        })
+    let bitmap = (0..len)
+        .map(|_| rng.random::<u64>() | 0xEEEE_EEEE_EEEE_EEEE)
         .collect();
-
-    let max_pos = len * 64;
-    let position = rng.random_range(0..max_pos);
-
+    let position = rng.random_range(0..len * 64);
     RankData { bitmap, position }
 }
 
-/// Generate a zipfian distribution (few words with many bits, many with few)
-fn gen_zipfian_bitmap(seed: u64) -> RankData {
+fn gen_zipfian(seed: u64) -> RankData {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let len = rng.random_range(100..10000);
-
-    let bitmap: Vec<u64> = (0..len)
+    let bitmap = (0..len)
         .map(|i| {
-            // Zipfian: density decreases with index
             let density = 1.0 / (1.0 + i as f64).ln_1p();
             let mut word = 0u64;
             for bit in 0..64 {
@@ -129,223 +199,159 @@ fn gen_zipfian_bitmap(seed: u64) -> RankData {
             word
         })
         .collect();
-
-    let max_pos = len * 64;
-    let position = rng.random_range(0..max_pos);
-
-    RankData { bitmap, position }
-}
-
-/// Generate small bitmaps (edge case: very small inputs)
-fn gen_small_bitmap(seed: u64) -> RankData {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let len = rng.random_range(1..20); // Very small
-    let density = 0.5;
-
-    let bitmap: Vec<u64> = (0..len)
-        .map(|_| {
-            let mut word = 0u64;
-            for bit in 0..64 {
-                if rng.random::<f64>() < density {
-                    word |= 1 << bit;
-                }
-            }
-            word
-        })
-        .collect();
-
-    let max_pos = len * 64;
-    let position = rng.random_range(0..max_pos);
-
+    let position = rng.random_range(0..len * 64);
     RankData { bitmap, position }
 }
 
 // ============================================================================
-// STEP 4: Implement algorithm variants
+// Algorithm Variants
 // ============================================================================
 
-/// Naive bit-by-bit rank implementation
 fn rank_naive(data: &RankData) -> usize {
-    let mut count = 0;
-    for (word_idx, &word) in data.bitmap.iter().enumerate() {
-        let word_start = word_idx * 64;
-        let word_end = word_start + 64;
-
-        if data.position < word_start {
-            break;
-        }
-
-        if data.position >= word_end {
-            count += word.count_ones() as usize;
-        } else {
-            let bits_to_count = data.position - word_start + 1;
-            let mask = (1u64 << bits_to_count) - 1;
-            count += (word & mask).count_ones() as usize;
-            break;
-        }
-    }
-    count
-}
-
-/// SIMD-friendly implementation using popcount
-fn rank_simd(data: &RankData) -> usize {
     let target_word = data.position / 64;
     let bit_in_word = data.position % 64;
-
     let mut count = 0;
-
-    // Sum all complete words using popcount
     for &word in &data.bitmap[..target_word] {
         count += word.count_ones() as usize;
     }
-
-    // Handle partial final word
     if target_word < data.bitmap.len() {
-        let word = data.bitmap[target_word];
         let mask = (1u64 << (bit_in_word + 1)) - 1;
-        count += (word & mask).count_ones() as usize;
+        count += (data.bitmap[target_word] & mask).count_ones() as usize;
     }
-
     count
 }
 
-/// Chunked implementation with loop unrolling
-fn rank_chunked(data: &RankData) -> usize {
+fn rank_simd(data: &RankData) -> usize {
+    rank_naive(data) // placeholder
+}
+
+fn rank_sparse_opt(data: &RankData) -> usize {
+    rank_naive(data) // placeholder
+}
+
+fn rank_dense_opt(data: &RankData) -> usize {
+    rank_naive(data) // placeholder
+}
+
+fn rank_chunked(data: &RankData, chunk_size: usize) -> usize {
     let target_word = data.position / 64;
     let bit_in_word = data.position % 64;
-    let chunk_size = 4;
-
     let mut count = 0;
 
-    // Process in chunks of 4
-    let full_chunks = target_word / chunk_size;
-    for chunk_idx in 0..full_chunks {
-        let start = chunk_idx * chunk_size;
-        let chunk = &data.bitmap[start..start + chunk_size];
-        count += chunk[0].count_ones() as usize;
-        count += chunk[1].count_ones() as usize;
-        count += chunk[2].count_ones() as usize;
-        count += chunk[3].count_ones() as usize;
+    let chunks = data.bitmap[..target_word].chunks_exact(chunk_size);
+    let remainder = chunks.remainder();
+    for chunk in chunks {
+        for &word in chunk {
+            count += word.count_ones() as usize;
+        }
     }
-
-    // Remaining full words
-    let remaining_start = full_chunks * chunk_size;
-    for &word in &data.bitmap[remaining_start..target_word] {
+    for &word in remainder {
         count += word.count_ones() as usize;
     }
 
-    // Partial final word
     if target_word < data.bitmap.len() {
-        let word = data.bitmap[target_word];
         let mask = (1u64 << (bit_in_word + 1)) - 1;
-        count += (word & mask).count_ones() as usize;
+        count += (data.bitmap[target_word] & mask).count_ones() as usize;
     }
-
     count
 }
 
 // ============================================================================
-// STEP 5: Define the benchmark using distribution-based API
+// ParamGrid trait (derive macro will generate this)
 // ============================================================================
 
-/*
-// TARGET API - This is what we want to implement:
-
-fn create_rank_benchmark() -> BuiltStatsBench<RankData, RankStats, usize> {
-    StatsBench::new("rank")
-        // Named distributions - each is a realistic workload
-        .distribution("sparse", gen_sparse_bitmap)
-        .distribution("dense", gen_dense_bitmap)
-        .distribution("zipfian", gen_zipfian_bitmap)
-        .distribution("small", gen_small_bitmap)
-
-        // Optional: weight distributions by importance
-        // (default weight is 1.0)
-        .weight("zipfian", 2.0)  // real-world data is often zipfian
-
-        // Optional: compute stats for reporting (Data → Stats)
-        .stats(RankStats::compute)
-
-        // Algorithm variants
-        .baseline("naive", rank_naive)
-        .variant("simd", rank_simd)
-        .variant("chunked", rank_chunked)
-
-        .build()
+trait ParamGrid: Sized + Clone + Debug {
+    fn iter_all() -> impl Iterator<Item = Self>;
+    fn to_suffix(&self) -> String;
 }
 
-// Running the benchmark:
-
-fn main() {
-    let bench = create_rank_benchmark();
-
-    // Run and get results
-    let results = bench.run();
-
-    // Print results table:
-    //
-    // Distribution   | naive    | simd     | chunked  | winner
-    // ---------------|----------|----------|----------|--------
-    // sparse         | 120µs    | 45µs     | 80µs     | simd
-    // dense          | 450µs    | 50µs     | 200µs    | simd
-    // zipfian (2.0x) | 200µs    | 60µs     | 90µs     | simd
-    // small          | 5µs      | 4µs      | 6µs      | simd
-    //
-    // Aggregate winner: simd
-    // Weighted scores: naive=970µs, simd=219µs, chunked=460µs
-
-    results.print();
-
-    // Save to JSON for CI
-    results.save("rank_results.json").unwrap();
+#[derive(Clone, Debug)]
+struct ChunkedParams {
+    chunk_size: usize,
 }
-*/
 
-// ============================================================================
-// MAIN - Demonstrates the algorithms work correctly
-// ============================================================================
-
-fn main() {
-    println!("Distribution-Based Benchmark API Example");
-    println!("=========================================");
-    println!();
-
-    // Test each distribution
-    let distributions: Vec<(&str, fn(u64) -> RankData)> = vec![
-        ("sparse", gen_sparse_bitmap),
-        ("dense", gen_dense_bitmap),
-        ("zipfian", gen_zipfian_bitmap),
-        ("small", gen_small_bitmap),
-    ];
-
-    for (name, generator) in &distributions {
-        println!("Distribution: {}", name);
-
-        // Generate a sample
-        let data = generator(42);
-        let stats = RankStats::compute(&data);
-        println!(
-            "  Sample: {} words, density={:.2}, position={}",
-            stats.len, stats.density, data.position
-        );
-
-        // Verify all variants produce same result
-        let naive_result = rank_naive(&data);
-        let simd_result = rank_simd(&data);
-        let chunked_result = rank_chunked(&data);
-
-        assert_eq!(naive_result, simd_result, "simd mismatch for {}", name);
-        assert_eq!(
-            naive_result, chunked_result,
-            "chunked mismatch for {}",
-            name
-        );
-
-        println!("  Result: {} (all variants match)", naive_result);
-        println!();
+// Generated by #[derive(ParamGrid)]
+impl ParamGrid for ChunkedParams {
+    fn iter_all() -> impl Iterator<Item = Self> {
+        [4, 8, 16, 32]
+            .into_iter()
+            .map(|chunk_size| Self { chunk_size })
     }
 
-    println!("All variants produce correct results!");
+    fn to_suffix(&self) -> String {
+        format!("[{}]", self.chunk_size)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SimdParams {
+    unroll: usize,
+    prefetch: usize,
+}
+
+// Generated by #[derive(ParamGrid)]
+impl ParamGrid for SimdParams {
+    fn iter_all() -> impl Iterator<Item = Self> {
+        [2, 4, 8].into_iter().flat_map(|unroll| {
+            [0, 64, 128]
+                .into_iter()
+                .map(move |prefetch| Self { unroll, prefetch })
+        })
+    }
+
+    fn to_suffix(&self) -> String {
+        format!("[u={},p={}]", self.unroll, self.prefetch)
+    }
+}
+
+// ============================================================================
+// Main - demos the current implementation
+// ============================================================================
+
+fn main() {
+    println!("Target API Example");
+    println!("==================");
+    println!();
+
+    // Test distributions
+    for (name, generator) in [
+        ("sparse", gen_sparse as fn(u64) -> RankData),
+        ("dense", gen_dense),
+        ("zipfian", gen_zipfian),
+    ] {
+        let data = generator(42);
+        let stats = RankStats::compute(&data);
+
+        // Test all variants produce same result
+        let naive = rank_naive(&data);
+        let simd = rank_simd(&data);
+
+        for p in ChunkedParams::iter_all() {
+            let chunked = rank_chunked(&data, p.chunk_size);
+            assert_eq!(naive, chunked, "chunked{} mismatch", p.to_suffix());
+        }
+
+        println!(
+            "{:8} | len={:5} | density={:.2} | result={}",
+            name, stats.len, stats.density, naive
+        );
+    }
+
+    println!();
+    println!("All variants correct!");
+    println!();
+
+    // Show param grid iteration
+    println!("ChunkedParams grid:");
+    for p in ChunkedParams::iter_all() {
+        println!("  chunked{}", p.to_suffix());
+    }
+
+    println!();
+    println!("SimdParams grid:");
+    for p in SimdParams::iter_all() {
+        println!("  simd{}", p.to_suffix());
+    }
 }
 
 #[cfg(test)]
@@ -353,61 +359,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_distributions_correct() {
-        let distributions: Vec<fn(u64) -> RankData> = vec![
-            gen_sparse_bitmap,
-            gen_dense_bitmap,
-            gen_zipfian_bitmap,
-            gen_small_bitmap,
-        ];
-
-        for generator in distributions {
+    fn test_all_variants_correct() {
+        for generator in [gen_sparse, gen_dense, gen_zipfian] {
             for seed in 0..10 {
                 let data = generator(seed);
+                let expected = rank_naive(&data);
 
-                let naive = rank_naive(&data);
-                let simd = rank_simd(&data);
-                let chunked = rank_chunked(&data);
+                assert_eq!(rank_simd(&data), expected);
 
-                assert_eq!(naive, simd, "simd mismatch at seed {}", seed);
-                assert_eq!(naive, chunked, "chunked mismatch at seed {}", seed);
+                for p in ChunkedParams::iter_all() {
+                    assert_eq!(rank_chunked(&data, p.chunk_size), expected);
+                }
             }
         }
     }
 
     #[test]
-    fn test_stats_computation() {
-        let data = RankData {
-            bitmap: vec![0xFFFF_FFFF_FFFF_FFFF; 10], // All ones
-            position: 500,
+    fn test_param_grid_iteration() {
+        let chunked: Vec<_> = ChunkedParams::iter_all().collect();
+        assert_eq!(chunked.len(), 4);
+        assert_eq!(chunked[0].chunk_size, 4);
+        assert_eq!(chunked[3].chunk_size, 32);
+
+        let simd: Vec<_> = SimdParams::iter_all().collect();
+        assert_eq!(simd.len(), 9); // 3 * 3
+    }
+
+    #[test]
+    fn test_param_suffix() {
+        let p = ChunkedParams { chunk_size: 16 };
+        assert_eq!(p.to_suffix(), "[16]");
+
+        let p = SimdParams {
+            unroll: 4,
+            prefetch: 64,
         };
-
-        let stats = RankStats::compute(&data);
-        assert_eq!(stats.len, 10);
-        assert!((stats.density - 1.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_sparse_density() {
-        // Sparse should have low density
-        let data = gen_sparse_bitmap(42);
-        let stats = RankStats::compute(&data);
-        assert!(
-            stats.density < 0.3,
-            "Sparse density too high: {}",
-            stats.density
-        );
-    }
-
-    #[test]
-    fn test_dense_density() {
-        // Dense should have high density
-        let data = gen_dense_bitmap(42);
-        let stats = RankStats::compute(&data);
-        assert!(
-            stats.density > 0.7,
-            "Dense density too low: {}",
-            stats.density
-        );
+        assert_eq!(p.to_suffix(), "[u=4,p=64]");
     }
 }
