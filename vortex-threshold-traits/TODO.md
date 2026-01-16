@@ -2,11 +2,11 @@
 
 ## Overview
 
-This tracks implementation progress against the design in `plan/`. The goal is a system that:
-1. Benchmarks algorithm variants with tunable parameters
-2. Computes stats from input data (len, density, etc.)
-3. Finds crossover points where one variant becomes faster
-4. Supports two modes: `bench()` (quick) and `search()` (full grid)
+This tracks implementation progress. The goal is a system that:
+1. Benchmarks algorithm variants against **named data distributions**
+2. Computes stats from generated data (for analysis/reporting)
+3. Finds the variant that **minimizes aggregate runtime** across distributions
+4. Supports weighted distributions (real-world data can matter more)
 
 ---
 
@@ -32,66 +32,105 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 
 ---
 
-## Phase 2: Stats-Based API ✅ COMPLETE
+## Phase 2: Distribution-Based API 🚧 IN PROGRESS
 
 **Priority: HIGH** - Core API redesign
 
-- [x] **2.1 Define `Stats` concept**
-  - Location: `vortex-threshold-traits/src/stats.rs`
-  - [x] `StatsPoint` - dynamic stats container with named dimensions
-  - [x] Stats computed from Data via user-provided closure
+### 2.1 Distribution Concept (NEW)
 
-- [x] **2.2 Implement `StatsGrid`**
-  - [x] Builder for multi-dimensional stats grids
-  - [x] `.dimension("len", Scale::log2(6, 20))`
-  - [x] `.dimension("density", Scale::steps(0.0, 1.0, 0.1))`
-  - [x] Iterator over all stats combinations (`StatsGridIter`)
+Replace `StatsGrid` with named distributions:
 
-- [x] **2.3 Implement `Scale` enum**
-  - Location: `vortex-threshold-traits/src/scale.rs`
-  - [x] `Scale::log2`, `Scale::log`, `Scale::linear`, `Scale::steps`, `Scale::explicit`
+```rust
+StatsBench::new("rank")
+    .distribution("uniform_sparse", |seed| gen_bitmap(seed, 0.1))
+    .distribution("uniform_dense", |seed| gen_bitmap(seed, 0.9))
+    .distribution("zipfian", |seed| gen_zipfian(seed))
+    .distribution("real_parquet", |seed| sample_parquet(seed))
+```
 
-- [x] **2.4 Implement `StatsBench` builder**
-  - Location: `vortex-threshold-traits/src/bench.rs`
-  - [x] `.stats()`, `.generate()`, `.stats_grid()`, `.baseline()`, `.variant()`
+- [ ] **2.1.1 Define `Distribution` struct**
+  - Name (string identifier)
+  - Generator function: `Fn(u64) -> Data`
+  - Optional weight (default 1.0)
 
----
+- [ ] **2.1.2 Update `StatsBench` builder**
+  - [x] `.baseline()`, `.variant()` - existing, keep as-is
+  - [ ] `.distribution(name, generator)` - NEW, replaces `.stats_grid()`
+  - [ ] `.weight(name, weight)` - NEW, for distribution importance
+  - [ ] Remove `.stats_grid()`, `.generate()` from required API
 
-## Phase 3: Per-Variant Parameters
+- [ ] **2.1.3 Optional stats computation**
+  - [ ] `.stats(|data| Stats)` - optional, for reporting only
+  - Stats are computed FROM data, not used to generate data
 
-**Priority: MEDIUM** - Enables parameter tuning per variant
+### 2.2 Keep from Old API
 
-- [ ] **3.1 Design `ParamGrid` trait**
-- [ ] **3.2 Implement `ParamGrid` derive macro** (new crate)
-- [ ] **3.3 Update `StatsBench` with `.variant_with_params::<P>()`**
-
----
-
-## Phase 4: Two Modes (Bench vs Search) ⚠️ PARTIAL
-
-- [x] **4.1 `BenchRunner`** - `.at()`, `.run()`, `.print()`
-- [x] **4.2 `SearchRunner`** - grid search, winners detection
-- [x] **4.3 Entry points** - `.bench()`, `.search()`
-- [ ] `.refine()` - binary search refinement
-- [ ] Crossover detection
+- [x] `Scale` enum (log2, linear, steps, explicit) - useful for param ranges
+- [x] `Measurer` - measurement infrastructure
+- [x] `Variant` with CPU feature requirements
 
 ---
 
-## Phase 5: Output & Display ⚠️ PARTIAL
+## Phase 3: Optimizer 🔲 NOT STARTED
 
-- [x] Basic terminal output with print()
-- [ ] Divan-style aligned columns
-- [ ] JSON export (`.save()`, `.to_json()`)
-- [ ] Comparison mode
+**Priority: HIGH** - Core value proposition
+
+- [ ] **3.1 Aggregate runtime calculation**
+  ```
+  score(variant) = Σ weight[dist] × mean_runtime[variant, dist]
+  ```
+
+- [ ] **3.2 Winner detection**
+  - Per-distribution winners
+  - Aggregate winner (minimizes weighted sum)
+  - Confidence intervals on winner selection
+
+- [ ] **3.3 Results struct**
+  ```rust
+  struct BenchResults {
+      per_distribution: HashMap<String, DistributionResults>,
+      aggregate_winner: String,
+      aggregate_scores: HashMap<String, f64>,
+  }
+  ```
 
 ---
 
-## Phase 6-7: Refinement, Storage & CI
+## Phase 4: Per-Variant Parameters 🔲 NOT STARTED
 
-- [ ] Binary search refinement
-- [ ] SQLite storage
-- [ ] Code generation
-- [ ] CI workflow
+**Priority: MEDIUM** - Enables parameter tuning
+
+- [ ] **4.1 `ParamGrid` trait**
+- [ ] **4.2 `ParamGrid` derive macro** (new crate)
+- [ ] **4.3 `.variant_with_params::<P>(name, fn)`**
+
+---
+
+## Phase 5: Output & Export 🔲 NOT STARTED
+
+**Priority: MEDIUM** - CI integration
+
+- [ ] **5.1 Terminal output**
+  - Per-distribution table
+  - Aggregate summary
+  - Winner highlighting
+
+- [ ] **5.2 JSON export**
+  - `.save(path)`
+  - `.to_json()`
+
+- [ ] **5.3 Comparison mode**
+  - Compare against baseline commit
+
+---
+
+## Phase 6: Storage & CI 🔲 NOT STARTED
+
+**Priority: LOW** - Scale to CI
+
+- [ ] SQLite schema update for distributions
+- [ ] Code generation for dispatch tables
+- [ ] CI workflow testing
 
 ---
 
@@ -100,18 +139,17 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 | Phase | Status | Notes |
 |-------|--------|-------|
 | 1. Measurement | **DONE** | `Measurer`, `BatchSize`, IQR, bootstrap CI |
-| 2. Stats API | **DONE** | `Scale`, `StatsGrid`, `StatsBench` builder |
-| 3. ParamGrid | Not started | No derive macro yet |
-| 4. Two Modes | **Partial** | Basic BenchRunner/SearchRunner work |
-| 5. Output | **Partial** | Basic print(), no JSON/save |
-| 6. Refinement | Not started | |
-| 7. Storage/CI | Not started | Trait exists only |
+| 2. Distribution API | **In Progress** | Replacing StatsGrid with named distributions |
+| 3. Optimizer | Not started | Aggregate minimization |
+| 4. ParamGrid | Not started | Per-variant param tuning |
+| 5. Output | Not started | JSON, terminal display |
+| 6. Storage/CI | Not started | SQLite, code gen |
 
 ---
 
 ## Next Steps
 
-1. ~~**Phase 1** (Measurement) - DONE~~
-2. ~~**Phase 2** (Stats API) - DONE~~
-3. **Phase 3** (ParamGrid derive) - enables tunable per-variant params
-4. **Phase 5** (Output) - JSON export, better terminal display
+1. **Implement Distribution struct** - simple wrapper around name + generator
+2. **Update StatsBench builder** - add `.distribution()`, make `.stats()` optional
+3. **Implement Optimizer** - aggregate scoring, winner detection
+4. **Update example** - show new distribution-based API

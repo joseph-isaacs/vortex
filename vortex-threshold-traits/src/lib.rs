@@ -506,7 +506,7 @@ impl CpuClass {
                     return Self::detect_amd();
                 }
             }
-            return Self::Unknown;
+            Self::Unknown
         }
 
         #[cfg(target_arch = "aarch64")]

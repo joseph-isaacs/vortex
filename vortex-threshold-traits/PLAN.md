@@ -2,62 +2,132 @@
 
 ## Goal
 
-Automatically detect crossover points where one algorithm implementation becomes faster than another across different CPU architectures, enabling Vortex to dynamically select optimal implementations at runtime.
+Find the optimal algorithm variant for each CPU class by benchmarking against realistic, named data distributions. The optimizer minimizes aggregate runtime across all distributions.
+
+## Core Design: Distribution-Based Benchmarking
+
+### The Problem with Parameter Grids
+
+Old approach: Define a grid of stats (len × density × ...) and try to generate data matching each point.
+
+Issues:
+- Hard to generate data matching specific stats
+- Artificial - real workloads don't come from grids
+- Combinatorial explosion with multiple dimensions
+
+### New Approach: Named Distributions
+
+Define named distributions that represent real workloads:
+
+```rust
+StatsBench::new("rank")
+    .distribution("uniform_sparse", |seed| gen_bitmap(seed, density: 0.1))
+    .distribution("uniform_dense", |seed| gen_bitmap(seed, density: 0.9))
+    .distribution("zipfian", |seed| gen_zipfian(seed))
+    .distribution("real_parquet", |seed| sample_from_corpus(seed))
+    .weight("real_parquet", 2.0)  // real data matters more
+
+    .stats(|data| RankStats::compute(data))  // optional, for reporting
+
+    .baseline("naive", rank_naive)
+    .variant("simd", rank_simd)
+    .build();
+```
+
+Data flow:
+```
+seed → Data → Stats (optional, for reporting)
+         ↓
+    benchmark variants
+         ↓
+    aggregate across distributions
+         ↓
+    find optimal variant
+```
 
 ## Components
 
-The system is divided into three main components:
+### 1. Benchmark Core (`vortex-threshold-traits`)
 
-### 1. [Benchmark Runner & Grid Search](./plan/benchmark/plan.md)
-Responsible for gathering performance data by running algorithms across parameter ranges.
+**Distribution struct:**
+```rust
+struct Distribution<D> {
+    name: String,
+    generator: Box<dyn Fn(u64) -> D>,
+    weight: f64,  // default 1.0
+}
+```
 
-- Parameter space exploration (linear, log, explicit scales)
-- Grid search for crossover detection
-- Binary search refinement for precise thresholds
-- Statistical measurement (multiple iterations, warmup)
-- See also: [Measurement Quality](./plan/benchmark/measurement.md)
+**StatsBench builder:**
+```rust
+StatsBench::new("name")
+    .distribution(name, generator)  // required, at least one
+    .weight(name, weight)           // optional
+    .stats(fn)                      // optional, for reporting
+    .baseline(name, fn)             // required
+    .variant(name, fn)              // optional, zero or more
+    .build()
+```
 
-### 2. [Data Storage & Production](./plan/storage/plan.md)
-Responsible for persisting benchmark results and producing threshold data.
+**Measurer** (existing, keep as-is):
+- Warmup, batching, black_box
+- IQR outlier removal
+- Bootstrap confidence intervals
 
-- SQLite backend for local/CI storage
-- JSON export for CI artifacts
-- Rust code generation for static dispatch tables
-- Query interface for historical analysis
+### 2. Optimizer (`vortex-threshold-runner`)
 
-### 3. [CI Runners & Infrastructure](./plan/runners/plan.md)
-Responsible for running benchmarks across multiple CPU architectures in CI.
+**Aggregate scoring:**
+```
+score(variant) = Σ weight[dist] × mean_runtime[variant, dist]
+```
 
-- GitHub Actions workflow configuration
-- Multi-architecture runner matrix
-- Artifact collection and aggregation
-- PR integration (comments, checks)
+**Output:**
+```
+Distribution       | naive    | simd     | chunked  | winner
+-------------------|----------|----------|----------|--------
+uniform_sparse     | 120µs    | 45µs     | 80µs     | simd
+uniform_dense      | 450µs    | 50µs     | 200µs    | simd
+zipfian            | 200µs    | 60µs     | 90µs     | simd
+real_parquet (2x)  | 180µs    | 55µs     | 85µs     | simd
 
-## Current State
+Aggregate winner: simd
+Weighted scores: naive=1130µs, simd=260µs, chunked=535µs
+```
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Benchmark Runner | Partial | Grid search done, binary search not implemented |
-| Data Storage | Partial | SQLite done, code generation done |
-| CI Runners | Scaffold | Workflow template exists, not tested |
+### 3. Code Generation (`vortex-threshold-aggregator`)
 
-## Priority Order
+Generate dispatch tables per CPU class:
 
-1. **Benchmark Runner** - Core functionality, must work locally first
-2. **Data Storage** - Need to persist and aggregate results
-3. **CI Runners** - Scale to multiple architectures
+```rust
+static RANK_IMPL: LazyLock<fn(&Data) -> Output> = LazyLock::new(|| {
+    match CpuClass::detect() {
+        CpuClass::IntelSapphire => rank_avx2,
+        CpuClass::Graviton3 => rank_neon,
+        _ => rank_simd,
+    }
+});
+```
+
+## Implementation Phases
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1. Measurement | Measurer, stats, CI | ✅ Done |
+| 2. Distribution API | Replace StatsGrid | 🚧 In Progress |
+| 3. Optimizer | Aggregate scoring | 🔲 Not Started |
+| 4. ParamGrid | Per-variant params | 🔲 Not Started |
+| 5. Output | JSON, terminal | 🔲 Not Started |
+| 6. CI | Storage, codegen | 🔲 Not Started |
 
 ## Open Questions
 
-- [ ] What statistical significance level is required for crossover detection?
-- [ ] How to handle noisy measurements on shared CI runners?
-- [ ] Should thresholds be per-commit or aggregated over time windows?
-- [ ] How to version/migrate threshold data when algorithms change?
+- How many samples per distribution? (Fixed N, or adaptive?)
+- How to handle distributions with different data sizes?
+- Should we support distribution "families" (e.g., sparse with varying sizes)?
 
 ## Sub-Documents
 
-- [plan/benchmark/](./plan/benchmark/) - Benchmark runner & grid search
-  - [plan.md](./plan/benchmark/plan.md) - Main benchmark planning
-  - [measurement.md](./plan/benchmark/measurement.md) - Measurement quality & iteration mechanics
-- [plan/storage/plan.md](./plan/storage/plan.md) - Data storage & production
-- [plan/runners/plan.md](./plan/runners/plan.md) - CI runners & infrastructure
+- [plan/benchmark/plan.md](./plan/benchmark/plan.md) - Measurement details
+- [plan/benchmark/measurement.md](./plan/benchmark/measurement.md) - Statistical methods
+- [plan/storage/plan.md](./plan/storage/plan.md) - Persistence layer
+- [plan/runners/plan.md](./plan/runners/plan.md) - CI infrastructure

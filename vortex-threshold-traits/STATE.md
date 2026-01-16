@@ -2,7 +2,21 @@
 
 ## Overview
 
-The ISA Threshold Finder is a system for automatically detecting crossover points where one algorithm implementation becomes faster than another across different CPU architectures. This enables Vortex to dynamically select the optimal implementation at runtime based on input size and CPU type.
+The ISA Threshold Finder is a system for automatically detecting which algorithm implementation performs best across different data distributions and CPU architectures. It enables Vortex to select optimal implementations by benchmarking against realistic workloads.
+
+## Core Concept: Distribution-Based Benchmarking
+
+Instead of searching over artificial parameter grids, we benchmark against **named data distributions** that represent real workloads:
+
+```
+seed → Data → Stats (computed for reporting)
+         ↓
+    run variants → measure
+         ↓
+    aggregate across distributions → find optimal variant
+```
+
+Key insight: Generate realistic data first, then compute its stats for analysis—don't try to generate data targeting specific stats.
 
 ## Architecture
 
@@ -12,16 +26,16 @@ The ISA Threshold Finder is a system for automatically detecting crossover point
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  vortex-threshold-traits     Core trait definitions & builder API        │
-│  ├── BenchmarkableAlgorithm  Trait for benchmarkable algorithms          │
-│  ├── ThresholdBench          Criterion-like builder for easy setup       │
-│  ├── ParameterScale          Linear/Log/Explicit parameter ranges        │
+│  ├── StatsBench              Distribution-based benchmark builder        │
+│  ├── Distribution            Named data generator (seed → Data)          │
 │  ├── Variant                 Algorithm variant with CPU feature reqs     │
 │  ├── CpuClass                Runtime CPU detection (Intel/AMD/ARM)       │
+│  ├── Measurer                Statistical measurement infrastructure      │
 │  └── BenchmarkStorage        Trait for result persistence                │
 │                                                                          │
 │  vortex-threshold-runner     CLI tool for running benchmarks             │
-│  ├── GridSearch              Sweeps parameter space, finds crossovers    │
-│  ├── examples/               Popcount (trait) and Sum (builder) demos    │
+│  ├── Optimizer               Finds variant minimizing aggregate runtime  │
+│  ├── examples/               Popcount, Sum, Rank demos                   │
 │  └── storage/sqlite          SQLite backend for result persistence       │
 │                                                                          │
 │  vortex-threshold-aggregator Merges results, generates Rust code         │
@@ -30,52 +44,62 @@ The ISA Threshold Finder is a system for automatically detecting crossover point
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## API Styles
-
-### 1. Builder API (Recommended for most cases)
+## API: Distribution-Based Builder
 
 ```rust
-use vortex_threshold_traits::{ThresholdBench, ParameterScale, AlgorithmRegistry};
+use vortex_threshold_traits::StatsBench;
 
-let mut registry = AlgorithmRegistry::new();
+StatsBench::new("rank")
+    // Named distributions - each generates realistic data
+    .distribution("uniform_sparse", |seed| gen_bitmap(seed, density: 0.1, len: 1..10000))
+    .distribution("uniform_dense", |seed| gen_bitmap(seed, density: 0.9, len: 1..10000))
+    .distribution("zipfian", |seed| gen_zipfian_bitmap(seed))
+    .distribution("real_parquet", |seed| sample_from_parquet_corpus(seed))
 
-ThresholdBench::new("sum")
-    .parameter("count", ParameterScale::log2(6, 20))
-    .input(|size, seed| random_vec(size, seed))
-    .baseline("naive", |data| sum_naive(data))
-    .variant("unrolled", |data| sum_unrolled(data))
-    .variant_if("avx2", is_x86_feature_detected!("avx2"), |data| sum_avx2(data))
-    .variant_with_features("neon", &["neon"], |data| sum_neon(data))
-    .register(&mut registry);
+    // Optional: compute stats from generated data (for analysis/reporting)
+    .stats(|data| RankStats { len: data.len(), density: compute_density(data) })
+
+    // Algorithm variants to compare
+    .baseline("naive", rank_naive)
+    .variant("simd", rank_simd)
+    .variant("chunked", rank_chunked)
+    .variant_with_features("avx2", &["avx2"], rank_avx2)
+
+    // Optional: weight distributions by importance
+    .weight("real_parquet", 2.0)  // real data matters more
+
+    .build();
 ```
 
-### 2. Trait API (For complex cases)
+## Optimization Goal
 
-```rust
-use vortex_threshold_traits::{BenchmarkableAlgorithm, ParameterScale, Variant};
+The optimizer finds the variant (or variant parameters) that **minimizes aggregate runtime across all distributions**:
 
-struct PopcountBenchmark;
-
-impl BenchmarkableAlgorithm for PopcountBenchmark {
-    type Input = Vec<u64>;
-    type Output = usize;
-
-    fn name(&self) -> &'static str { "popcount" }
-    fn parameter_name(&self) -> &'static str { "input_size" }
-    fn parameter_scale(&self) -> ParameterScale { ParameterScale::log2(6, 20) }
-
-    fn variants(&self) -> Vec<Variant> {
-        vec![
-            Variant::new("naive"),
-            Variant::new("avx2").with_features(&["avx2"]),
-        ]
-    }
-
-    fn generate_input(&self, param: usize, seed: u64) -> Self::Input { /* ... */ }
-    fn ground_truth(&self, input: &Self::Input) -> Self::Output { /* ... */ }
-    fn run_variant(&self, variant: &str, input: &Self::Input) -> Self::Output { /* ... */ }
-}
 ```
+minimize: Σ (weight[dist] × mean_runtime[variant, dist])
+```
+
+Results are reported per-distribution:
+
+```
+Distribution       | naive    | simd     | chunked  | winner
+-------------------|----------|----------|----------|--------
+uniform_sparse     | 120µs    | 45µs     | 80µs     | simd
+uniform_dense      | 450µs    | 50µs     | 200µs    | simd
+zipfian            | 200µs    | 60µs     | 90µs     | simd
+real_parquet       | 180µs    | 55µs     | 85µs     | simd
+
+Aggregate winner: simd (weighted total: 385µs)
+```
+
+## Data Flow
+
+1. **Define distributions**: Name your workloads, provide generator functions
+2. **Generate samples**: For each distribution, generate N samples with different seeds
+3. **Compute stats** (optional): Extract stats from each sample for grouping/analysis
+4. **Benchmark**: Run each variant on each sample, measure with proper warmup/iteration
+5. **Aggregate**: Compute per-distribution means, find weighted-optimal variant
+6. **Report**: Show results grouped by distribution, highlight winners
 
 ## Storage Layer
 
@@ -86,22 +110,18 @@ use vortex_threshold_runner::storage::SqliteStorage;
 
 let storage = SqliteStorage::open("benchmarks.db")?;
 
-// Store measurements
+// Store measurements grouped by distribution
 storage.store_measurements(&measurements)?;
 
-// Query by algorithm, variant, CPU class, commit, time range
+// Query by algorithm, distribution, variant, CPU class
 let query = MeasurementQuery::new()
-    .algorithm("popcount")
+    .algorithm("rank")
+    .distribution("real_parquet")
     .cpu_class(CpuClass::IntelSapphire)
     .since(yesterday);
 let results = storage.query_measurements(&query)?;
 
-// Get threshold history for regression detection
-let history = storage.get_threshold_history(
-    "popcount", "naive", "simd", CpuClass::IntelSapphire, 10
-)?;
-
-// Compare thresholds between commits
+// Compare performance between commits
 let diffs = storage.compare_commits("abc123", "def456")?;
 ```
 
@@ -121,24 +141,26 @@ GitHub Actions workflow (`.github/workflows/isa-thresholds.yml`) runs benchmarks
 ## Current Status
 
 ### Completed
-- [x] Core trait definitions (`BenchmarkableAlgorithm`)
-- [x] Builder API (`ThresholdBench`) - criterion-like ergonomics
-- [x] Parameter scales (Linear, Logarithmic, Explicit)
+- [x] Measurement infrastructure (`Measurer`, warmup, batching)
+- [x] Statistical analysis (IQR outlier removal, bootstrap confidence intervals)
 - [x] CPU feature detection and variant availability
 - [x] CPU class detection (Intel/AMD/ARM families)
-- [x] Grid search for crossover detection
-- [x] JSON output for CI artifact collection
-- [x] SQLite storage backend with query support
+- [x] Scale types (log2, linear, steps, explicit)
+- [x] SQLite storage backend (schema exists)
 - [x] GitHub Actions workflow template
 - [x] Example benchmarks (popcount, sum)
-- [x] Result aggregation and Rust code generation
+
+### In Progress
+- [ ] **Distribution-based API** - replace StatsGrid with named distributions
+- [ ] Optimizer for aggregate runtime minimization
+- [ ] Distribution weighting
 
 ### Not Yet Implemented
-- [ ] Binary search refinement for precise crossover points
-- [ ] Statistical significance testing (confidence intervals)
-- [ ] Automatic PR comments with threshold changes
+- [ ] JSON export (`.save()`, `.to_json()`)
+- [ ] Per-variant parameter tuning (ParamGrid derive macro)
+- [ ] Automatic PR comments with performance changes
 - [ ] Integration with actual Vortex algorithms (rank, select, etc.)
-- [ ] Dashboard/visualization for threshold trends
+- [ ] Dashboard/visualization for trends
 
 ## File Locations
 
@@ -146,18 +168,23 @@ GitHub Actions workflow (`.github/workflows/isa-thresholds.yml`) runs benchmarks
 vortex/
 ├── vortex-threshold-traits/
 │   ├── src/
-│   │   ├── lib.rs           # Core traits, CpuClass, ParameterScale
-│   │   ├── builder.rs       # ThresholdBench builder API
+│   │   ├── lib.rs           # Re-exports, CpuClass, Variant
+│   │   ├── bench.rs         # StatsBench builder API
+│   │   ├── measure.rs       # Measurer, statistical analysis
+│   │   ├── scale.rs         # Scale types (log2, linear, etc.)
+│   │   ├── stats.rs         # StatsPoint, StatsGrid (being replaced)
 │   │   └── storage.rs       # BenchmarkStorage trait
+│   ├── examples/
+│   │   └── target_api.rs    # Example usage (needs update)
 │   └── Cargo.toml
 │
 ├── vortex-threshold-runner/
 │   ├── src/
-│   │   ├── main.rs          # CLI, GridSearch implementation
+│   │   ├── main.rs          # CLI, benchmark execution
 │   │   ├── examples/
 │   │   │   ├── mod.rs
-│   │   │   ├── popcount.rs  # Trait-based example
-│   │   │   └── sum.rs       # Builder-based example
+│   │   │   ├── popcount.rs  # Popcount benchmark
+│   │   │   └── sum.rs       # Sum benchmark
 │   │   └── storage/
 │   │       ├── mod.rs
 │   │       └── sqlite.rs    # SQLite implementation
@@ -180,22 +207,11 @@ vortex/
 # Build the runner
 cargo build -p vortex-threshold-runner --release
 
-# Run with default examples
+# Run benchmarks
 ./target/release/threshold-runner --output results.json
 
 # Run specific algorithm
-./target/release/threshold-runner --algorithm popcount --output results.json
-```
-
-### Aggregating Results
-
-```bash
-# Merge results from multiple architectures
-./target/release/threshold-aggregator \
-    --input intel-sapphire.json \
-    --input amd-genoa.json \
-    --input graviton3.json \
-    --output src/thresholds.rs
+./target/release/threshold-runner --algorithm rank --output results.json
 ```
 
 ### Generated Code Example
@@ -204,20 +220,22 @@ cargo build -p vortex-threshold-runner --release
 use std::sync::LazyLock;
 use vortex_threshold_traits::CpuClass;
 
-static POPCOUNT_THRESHOLDS: LazyLock<PopcountThresholds> = LazyLock::new(|| {
+/// Best variant per CPU class, determined by aggregate performance across distributions
+static RANK_DISPATCH: LazyLock<fn(&RankData) -> usize> = LazyLock::new(|| {
     match CpuClass::detect() {
-        CpuClass::IntelSapphire => PopcountThresholds { naive_to_simd: 256 },
-        CpuClass::AmdGenoa => PopcountThresholds { naive_to_simd: 512 },
-        CpuClass::Graviton3 => PopcountThresholds { naive_to_simd: 128 },
-        _ => PopcountThresholds { naive_to_simd: 256 }, // default
+        CpuClass::IntelSapphire => rank_avx2,
+        CpuClass::AmdGenoa => rank_avx2,
+        CpuClass::Graviton3 => rank_neon,
+        _ => rank_simd,  // default
     }
 });
 ```
 
 ## Design Decisions
 
-1. **Two API styles**: Builder for simplicity, trait for control
-2. **Static code generation**: Zero runtime cost, thresholds baked into binary
-3. **SQLite for persistence**: Rich queries, no external dependencies
-4. **CpuClass enum**: Coarse-grained grouping, not per-model thresholds
-5. **Feature flags**: SQLite is optional (`--features sqlite`)
+1. **Distribution-based benchmarking**: Test against named, realistic workloads rather than artificial parameter grids
+2. **Aggregate optimization**: Find variant that minimizes weighted total across all distributions
+3. **seed → Data → Stats**: Generate data first, compute stats for reporting (not the reverse)
+4. **Static code generation**: Zero runtime cost, best variant baked into binary per CpuClass
+5. **SQLite for persistence**: Rich queries, regression detection, no external dependencies
+6. **Weighted distributions**: Real-world data distributions can matter more than synthetic ones
