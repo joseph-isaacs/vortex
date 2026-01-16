@@ -15,10 +15,20 @@ serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 rand = { workspace = true }
+vortex-array = { path = "../vortex-array" }
+vortex-buffer = { path = "../vortex-buffer" }
+vortex-dtype = { path = "../vortex-dtype" }
+vortex-error = { path = "../vortex-error" }
+vortex-mask = { path = "../vortex-mask" }
+vortex-scalar = { path = "../vortex-scalar" }
 
 [[example]]
 name = "target_api"
 path = "examples/target_api.rs"
+
+[[example]]
+name = "filter_plus_api"
+path = "examples/filter_plus_api.rs"
 
 [lints]
 workspace = true
