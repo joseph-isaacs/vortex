@@ -492,6 +492,13 @@ fn main() {
         "", "", "", "", "", "", ""
     );
 
+    // Density 0.01 (very sparse mask)
+    run_single_benchmark::<u8>(0.01, ITERATIONS);
+    run_single_benchmark::<u16>(0.01, ITERATIONS);
+    run_single_benchmark::<u32>(0.01, ITERATIONS);
+    run_single_benchmark::<u64>(0.01, ITERATIONS);
+    println!();
+
     // Density 0.1 (sparse mask)
     run_single_benchmark::<u8>(0.1, ITERATIONS);
     run_single_benchmark::<u16>(0.1, ITERATIONS);
