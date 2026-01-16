@@ -283,6 +283,16 @@ impl Measurer {
         }
     }
 
+    /// Collects samples using deferred drop (Divan-style).
+    ///
+    /// Key timing guarantees:
+    /// - Input generation: OUTSIDE timing
+    /// - Routine execution: INSIDE timing
+    /// - Output drop: OUTSIDE timing (deferred until batch complete)
+    /// - Input drop: OUTSIDE timing
+    ///
+    /// This matches Divan's approach where outputs are collected and dropped
+    /// after the timed section to avoid measuring deallocation time.
     fn collect_samples<I, O, S, R>(
         &self,
         setup: &S,
@@ -297,27 +307,41 @@ impl Measurer {
         let measurement_start = Instant::now();
 
         while measurement_start.elapsed() < self.measurement_time {
-            // Generate batch of inputs OUTSIDE timing
+            // 1. Generate batch of inputs OUTSIDE timing
             let inputs: Vec<I> = (0..iters_per_batch).map(|_| setup()).collect();
 
-            // Time the batch
+            // 2. Pre-allocate output storage to avoid allocation during timing
+            let mut outputs: Vec<O> = Vec::with_capacity(iters_per_batch);
+
+            // 3. Time ONLY the routine execution
+            //    - black_box(input) prevents input caching across iterations
+            //    - black_box(output) prevents dead code elimination
+            //    - outputs collected, NOT dropped, during timing
             let batch_start = Instant::now();
             for input in &inputs {
-                // black_box on BOTH input and output - CRITICAL!
-                black_box(routine(black_box(input)));
+                outputs.push(black_box(routine(black_box(input))));
             }
             let batch_elapsed = batch_start.elapsed();
 
-            // Record per-iteration time
+            // 4. Record per-iteration time
             let per_iter_ns = batch_elapsed.as_nanos() as f64 / iters_per_batch as f64;
             samples.push(per_iter_ns);
 
-            // Inputs dropped here, OUTSIDE timing
+            // 5. Drops happen HERE, OUTSIDE timing
+            //    - outputs dropped (deferred drop)
+            //    - inputs dropped
+            drop(outputs);
+            drop(inputs);
         }
 
         samples
     }
 
+    /// Collects samples for consuming routines using deferred drop.
+    ///
+    /// Same timing guarantees as `collect_samples`, but the routine takes
+    /// ownership of the input. Input drop time is still excluded since the
+    /// routine consumes the input during timing (which is unavoidable).
     fn collect_samples_consuming<I, O, S, R>(
         &self,
         setup: &S,
@@ -332,18 +356,25 @@ impl Measurer {
         let measurement_start = Instant::now();
 
         while measurement_start.elapsed() < self.measurement_time {
-            // Generate batch of inputs OUTSIDE timing
+            // 1. Generate batch of inputs OUTSIDE timing
             let inputs: Vec<I> = (0..iters_per_batch).map(|_| setup()).collect();
 
-            // Time the batch - routine consumes inputs
+            // 2. Pre-allocate output storage
+            let mut outputs: Vec<O> = Vec::with_capacity(iters_per_batch);
+
+            // 3. Time the routine - consumes inputs, collects outputs
             let batch_start = Instant::now();
             for input in inputs {
-                black_box(routine(black_box(input)));
+                outputs.push(black_box(routine(black_box(input))));
             }
             let batch_elapsed = batch_start.elapsed();
 
+            // 4. Record per-iteration time
             let per_iter_ns = batch_elapsed.as_nanos() as f64 / iters_per_batch as f64;
             samples.push(per_iter_ns);
+
+            // 5. Outputs dropped HERE, OUTSIDE timing
+            drop(outputs);
         }
 
         samples

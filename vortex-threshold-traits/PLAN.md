@@ -89,8 +89,8 @@ cargo run --release -- 'pop*'
 # List available benchmarks
 cargo run --release -- --list
 
-# Configure samples
-cargo run --release -- --samples 100
+# Configure samples and timing
+cargo run --release -- --samples 100 --warmup 100 --measurement 500
 
 # Output to JSON
 cargo run --release -- --output results.json
@@ -112,6 +112,133 @@ Best params: chunked { chunk_size: 8 }
 Aggregate winner: chunked[8] (weighted score: 515µs)
 ```
 
+## Measurement Inner Loop
+
+Based on [Divan](https://docs.rs/divan) and [Criterion](https://docs.rs/criterion) best practices.
+
+### Key Principles
+
+1. **`black_box` on BOTH inputs AND outputs** - Prevents compiler from pre-computing or eliminating code
+2. **Input generation OUTSIDE timing** - Don't measure allocation
+3. **Output drop OUTSIDE timing** - Deferred drop (Divan-style)
+4. **Batch iterations** - Amortize `Instant::now()` overhead for fast functions
+5. **Warmup phase** - Stabilize CPU frequency, fill caches
+
+### Inner Loop Implementation
+
+```rust
+fn collect_samples<I, O>(&self, setup: &impl Fn() -> I, routine: &impl Fn(&I) -> O) -> Vec<f64> {
+    let mut samples = Vec::new();
+    let measurement_start = Instant::now();
+
+    while measurement_start.elapsed() < self.measurement_time {
+        // 1. Generate batch of inputs OUTSIDE timing
+        let inputs: Vec<I> = (0..iters_per_batch).map(|_| setup()).collect();
+
+        // 2. Pre-allocate output storage to avoid allocation during timing
+        let mut outputs: Vec<O> = Vec::with_capacity(iters_per_batch);
+
+        // 3. Time ONLY the routine execution
+        //    - black_box(input) prevents input caching across iterations
+        //    - black_box(output) prevents dead code elimination
+        //    - outputs collected, NOT dropped, during timing
+        let batch_start = Instant::now();
+        for input in &inputs {
+            outputs.push(black_box(routine(black_box(input))));
+        }
+        let batch_elapsed = batch_start.elapsed();
+
+        // 4. Record per-iteration time
+        samples.push(batch_elapsed.as_nanos() as f64 / iters_per_batch as f64);
+
+        // 5. Drops happen HERE, OUTSIDE timing (deferred drop)
+        drop(outputs);
+        drop(inputs);
+    }
+
+    samples
+}
+```
+
+### Timing Model
+
+```
+NOT timed: setup() × iters_per_batch
+    TIMED: routine() × iters_per_batch
+NOT timed: drop(outputs), drop(inputs)
+```
+
+## Benchmark Run Loop
+
+```rust
+pub fn execute(self) -> BenchResults {
+    let measurer = Measurer::new()
+        .warmup_time(self.warmup)
+        .measurement_time(self.measurement_time);
+
+    let mut results = BenchResults::new(&self.bench.name);
+
+    // For each distribution
+    for dist in &self.bench.distributions {
+        // Generate samples, compute stats for each
+        let samples: Vec<(D, S)> = (0..self.num_samples)
+            .map(|i| {
+                let data = (dist.generator)(self.base_seed + i as u64);
+                let stats = (self.bench.stats_fn)(&data);
+                (data, stats)
+            })
+            .collect();
+
+        // For each variant × param combination
+        for (variant_name, run_fn) in self.bench.all_variant_combinations() {
+            let measurements: Vec<MeasurementResult> = samples
+                .iter()
+                .map(|(data, stats)| {
+                    measurer.measure(
+                        || data.clone(),
+                        |d| run_fn(d, stats),
+                    )
+                })
+                .collect();
+
+            results.add(&dist.name, &variant_name, aggregate(measurements));
+        }
+    }
+
+    results.compute_winners();
+    results
+}
+```
+
+## Configuration
+
+### Builder Defaults (can be overridden at runtime)
+
+```rust
+StatsBench::new("rank")
+    .warmup(Duration::from_millis(100))        // default
+    .measurement_time(Duration::from_millis(500))
+    .batch_size(BatchSize::Small)
+    ...
+```
+
+### Runtime Override
+
+```rust
+bench.run()
+    .warmup(Duration::from_millis(50))   // override
+    .samples(100)
+    .execute();
+```
+
+### CLI Override (highest priority)
+
+```bash
+cargo run --release -- --warmup 50 --measurement 200 --samples 100
+```
+
+**Priority**: CLI > runtime > builder > global defaults
+
 ## Components
 
 ### 1. Core Traits (`vortex-threshold-traits`)
@@ -120,7 +247,7 @@ Aggregate winner: chunked[8] (weighted score: 515µs)
 /// Trait for benchmarks - object-safe for registry
 pub trait Benchmark: Send + Sync {
     fn name(&self) -> &str;
-    fn run(&self, samples: usize, seed: u64) -> BenchResults;
+    fn run(&self, config: &RunConfig) -> BenchResults;
 }
 
 /// Trait for parameter grids - derive macro generates this
@@ -150,20 +277,24 @@ impl StatsBench<D, S, O> {
     pub fn variant(self, name: &str, f: impl Fn(&D, &S) -> O) -> Self;
     pub fn variant_params<P: ParamGrid>(self, name: &str, f: impl Fn(&D, &S, &P) -> O) -> Self;
 
+    // CPU feature gating
+    pub fn variant_if(self, name: &str, condition: bool, f: impl Fn(&D, &S) -> O) -> Self;
+
+    // Configuration
+    pub fn warmup(self, duration: Duration) -> Self;
+    pub fn measurement_time(self, duration: Duration) -> Self;
+
     pub fn build(self) -> impl Benchmark;
 }
 ```
 
-### 3. Macro (`vortex-threshold-macros`)
+### 3. Macros (`vortex-threshold-macros`)
 
 ```rust
-/// Registers a benchmark function for automatic collection
+/// Registers a benchmark function for automatic collection (like Divan)
 #[proc_macro_attribute]
 pub fn threshold_bench(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Uses `linkme` crate to collect at link time
-    // Generates:
-    //   #[linkme::distributed_slice(BENCHMARKS)]
-    //   static _BENCH_rank: fn() -> Box<dyn Benchmark> = || Box::new(rank_bench());
 }
 
 /// Derives ParamGrid trait for parameter structs
@@ -179,23 +310,26 @@ pub fn derive_param_grid(input: TokenStream) -> TokenStream {
 pub fn main() {
     let args = Args::parse();
 
-    // Collect all registered benchmarks
     let benchmarks: Vec<&dyn Benchmark> = BENCHMARKS
         .iter()
         .filter(|b| args.matches(b.name()))
         .collect();
 
     if args.list {
-        for b in &benchmarks {
-            println!("{}", b.name());
-        }
+        for b in &benchmarks { println!("{}", b.name()); }
         return;
     }
 
-    for bench in benchmarks {
-        let results = bench.run(args.samples, args.seed);
-        results.print();
+    let config = RunConfig {
+        warmup: args.warmup,
+        measurement_time: args.measurement,
+        samples: args.samples,
+        seed: args.seed,
+    };
 
+    for bench in benchmarks {
+        let results = bench.run(&config);
+        results.print();
         if let Some(path) = &args.output {
             results.save(path).unwrap();
         }
@@ -207,7 +341,7 @@ pub fn main() {
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1. Measurement | Measurer, warmup, CI | ✅ Done |
+| 1. Measurement | Measurer, warmup, deferred drop, CI | ✅ Done |
 | 2. Distribution API | Builder with distributions | 🚧 In Progress |
 | 3. ParamGrid | Derive macro for params | 🔲 Not Started |
 | 4. Runner Macro | `#[threshold_bench]` | 🔲 Not Started |
@@ -218,7 +352,7 @@ pub fn main() {
 ## Crate Structure
 
 ```
-vortex-threshold-traits/     Core traits, builder, results
+vortex-threshold-traits/     Core traits, builder, measurer
 vortex-threshold-macros/     #[threshold_bench], #[derive(ParamGrid)]
 vortex-threshold-runner/     CLI runner, main()
 vortex-threshold/            Re-exports everything (user-facing)
