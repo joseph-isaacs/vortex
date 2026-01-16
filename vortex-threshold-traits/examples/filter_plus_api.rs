@@ -244,8 +244,12 @@ impl FilterPlusStats {
 
 /// Generate filter/plus test data with a specific mask density
 fn gen_data<T: Element>(seed: u64, target_density: f64) -> FilterPlusData<T> {
+    gen_data_with_len(seed, 100_000, target_density) // 100k elements by default
+}
+
+/// Generate filter/plus test data with specific length and mask density
+fn gen_data_with_len<T: Element>(seed: u64, len: usize, target_density: f64) -> FilterPlusData<T> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let len = rng.random_range(1000..100000);
 
     let a: Vec<T> = (0..len).map(|_| T::random(&mut rng)).collect();
     let b: Vec<T> = (0..len).map(|_| T::random(&mut rng)).collect();
@@ -336,6 +340,60 @@ trait ParamGrid: Sized + Clone + Debug {
 // Main - demos the example
 // ============================================================================
 
+fn run_single_benchmark<T: Element + PartialEq>(density: f64, iterations: usize) {
+    let data: FilterPlusData<T> = gen_data(42, density);
+    let stats = FilterPlusStats::compute(&data);
+
+    // Verify correctness
+    let result1 = add_then_filter(&data);
+    let result2 = filter_then_add(&data);
+    assert_eq!(result1, result2, "results differ!");
+
+    // Warm up
+    for _ in 0..5 {
+        drop(add_then_filter(&data));
+        drop(filter_then_add(&data));
+    }
+
+    // Time add_then_filter
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        drop(std::hint::black_box(add_then_filter(std::hint::black_box(
+            &data,
+        ))));
+    }
+    let t1 = start.elapsed();
+
+    // Time filter_then_add
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        drop(std::hint::black_box(filter_then_add(std::hint::black_box(
+            &data,
+        ))));
+    }
+    let t2 = start.elapsed();
+
+    let winner = if t1 < t2 {
+        "add_then_filter"
+    } else {
+        "filter_then_add"
+    };
+
+    let t1_per_iter = t1.as_nanos() as f64 / iterations as f64 / 1000.0;
+    let t2_per_iter = t2.as_nanos() as f64 / iterations as f64 / 1000.0;
+
+    println!(
+        "{:>4} | {:>8} | {:>6.1} | {:>8} | {:>10.1}µs | {:>13.1}µs | {:>15}",
+        T::type_name(),
+        stats.len,
+        stats.mask_density,
+        stats.true_count,
+        t1_per_iter,
+        t2_per_iter,
+        winner
+    );
+}
+
 fn run_benchmark<T: Element + PartialEq>() {
     println!("Element type: {}", T::type_name());
     println!("{:-<60}", "");
@@ -408,8 +466,8 @@ fn run_benchmark<T: Element + PartialEq>() {
 }
 
 fn main() {
-    println!("Filter/Plus Optimization Example");
-    println!("=================================");
+    println!("Filter/Plus Optimization Benchmark");
+    println!("===================================");
     println!();
     println!("Problem: Given A, B, M compute (A + B) filtered by M");
     println!();
@@ -417,22 +475,48 @@ fn main() {
     println!("  1. add_then_filter: filter(A + B, M)");
     println!("  2. filter_then_add: filter(A, M) + filter(B, M)");
     println!();
-    println!("Trade-offs vary by element type (SIMD width, memory bandwidth)");
+
+    // Focused benchmark: 100k elements, densities 0.1 and 0.9
+    const ITERATIONS: usize = 50;
+    println!(
+        "Benchmark: 100,000 elements, {} iterations per measurement",
+        ITERATIONS
+    );
+    println!();
+    println!(
+        "{:>4} | {:>8} | {:>6} | {:>8} | {:>12} | {:>14} | {:>15}",
+        "Type", "Len", "Dens.", "True#", "add_then", "filter_then", "Winner"
+    );
+    println!(
+        "{:-<4}-+-{:-<8}-+-{:-<6}-+-{:-<8}-+-{:-<12}-+-{:-<14}-+-{:-<15}",
+        "", "", "", "", "", "", ""
+    );
+
+    // Density 0.1 (sparse mask)
+    run_single_benchmark::<u8>(0.1, ITERATIONS);
+    run_single_benchmark::<u16>(0.1, ITERATIONS);
+    run_single_benchmark::<u32>(0.1, ITERATIONS);
+    run_single_benchmark::<u64>(0.1, ITERATIONS);
     println!();
 
-    // Run benchmarks for each element type
-    run_benchmark::<u8>();
-    run_benchmark::<u16>();
-    run_benchmark::<u32>();
-    run_benchmark::<u64>();
+    // Density 0.9 (dense mask)
+    run_single_benchmark::<u8>(0.9, ITERATIONS);
+    run_single_benchmark::<u16>(0.9, ITERATIONS);
+    run_single_benchmark::<u32>(0.9, ITERATIONS);
+    run_single_benchmark::<u64>(0.9, ITERATIONS);
 
+    println!();
     println!("Key insight:");
-    println!("  The optimal strategy may vary by element type due to:");
+    println!("  With this simple Vec-based implementation, add_then_filter wins because:");
+    println!("  - filter_then_add creates two intermediate Vecs (extra allocation)");
+    println!("  - filter_then_add iterates over mask twice vs once");
+    println!();
+    println!("  In a real SIMD/columnar implementation, trade-offs would differ based on:");
     println!("  - SIMD lane width (more u8s fit in a register than u64s)");
     println!("  - Memory bandwidth (u8 arrays are 8x smaller than u64)");
     println!("  - Cache effects (smaller elements = more fit in cache)");
     println!();
-    println!("This is why we need to benchmark empirically across element types!");
+    println!("  This is why we need to benchmark empirically!");
 }
 
 #[cfg(test)]
