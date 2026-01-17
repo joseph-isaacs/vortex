@@ -111,7 +111,12 @@ impl<T: Element> FilterAddData<T> {
 // ============================================================================
 
 fn add_then_filter<T: Element>(data: &FilterAddData<T>) -> Vec<T> {
-    let sum: Vec<T> = data.a.iter().zip(&data.b).map(|(&a, &b)| a.add(b)).collect();
+    let sum: Vec<T> = data
+        .a
+        .iter()
+        .zip(&data.b)
+        .map(|(&a, &b)| a.add(b))
+        .collect();
     sum.into_iter()
         .zip(&data.mask)
         .filter(|&(_, &m)| m)
@@ -134,7 +139,11 @@ fn filter_then_add<T: Element>(data: &FilterAddData<T>) -> Vec<T> {
         .filter(|&(_, &m)| m)
         .map(|(&v, _)| v)
         .collect();
-    a_filt.iter().zip(&b_filt).map(|(&a, &b)| a.add(b)).collect()
+    a_filt
+        .iter()
+        .zip(&b_filt)
+        .map(|(&a, &b)| a.add(b))
+        .collect()
 }
 
 // ============================================================================
@@ -418,10 +427,7 @@ fn demo_type_erased() {
                     }
                 };
 
-                assert_eq!(
-                    result_add_then, result_filter_then,
-                    "Results should match"
-                );
+                assert_eq!(result_add_then, result_filter_then, "Results should match");
                 println!(
                     "  (len={:>5}, density={:.1}, type={:?}) -> output_len={}",
                     len, density, elem_type, result_add_then
@@ -450,6 +456,143 @@ fn demo_bevy_style() {
 }
 
 // ============================================================================
+// DEMO 3: Verification - check type state and dispatch are correct
+// ============================================================================
+
+fn demo_verification() {
+    println!("=== DEMO 3: Verification of Type State & Dispatch ===\n");
+
+    // Build the benchmark
+    let bench = UnifiedStatsBench::new("filter_add")
+        .len_values(vec![100]) // small for verification
+        .density_values(vec![0.5])
+        .for_types::<FilterAddBench, (u8, u16, u32)>()
+        .build();
+
+    println!("Registered types: {:?}", bench.type_names);
+    println!("Configs count: {}", bench.configs.len());
+    println!();
+
+    // Verify each type config
+    for &type_name in &bench.type_names {
+        let config = bench.configs.get(type_name).expect("config missing");
+
+        println!("--- Type: {} ---", type_name);
+        println!("  config.type_name() = {}", config.type_name());
+        println!("  variants: {:?}", config.variant_names());
+
+        // Generate data and verify it's the right type
+        let stats = FilterAddStats {
+            len: 10,
+            density: 0.5,
+        };
+        let data = config.generate_erased(&stats, 42);
+
+        // Try to downcast to each type to verify which one it actually is
+        let is_u8 = data.as_any().downcast_ref::<FilterAddData<u8>>().is_some();
+        let is_u16 = data.as_any().downcast_ref::<FilterAddData<u16>>().is_some();
+        let is_u32 = data.as_any().downcast_ref::<FilterAddData<u32>>().is_some();
+
+        println!(
+            "  Generated data type: u8={}, u16={}, u32={}",
+            is_u8, is_u16, is_u32
+        );
+
+        // Verify the expected type matches
+        let expected_type = match type_name {
+            "u8" => is_u8,
+            "u16" => is_u16,
+            "u32" => is_u32,
+            _ => false,
+        };
+        assert!(
+            expected_type,
+            "Type mismatch! Expected {} but got wrong type",
+            type_name
+        );
+        println!("  ✓ Type verification PASSED");
+
+        // Run variants and check they produce same output length
+        let result_add = config.run_variant_erased("add_then_filter", data.as_ref());
+        let result_filter = config.run_variant_erased("filter_then_add", data.as_ref());
+
+        println!("  add_then_filter output len: {}", result_add);
+        println!("  filter_then_add output len: {}", result_filter);
+        assert_eq!(
+            result_add, result_filter,
+            "Variant outputs should have same length"
+        );
+        println!("  ✓ Variant output lengths match");
+
+        println!();
+    }
+
+    // Verify ForType trait dispatch
+    println!("--- ForType<T> Trait Dispatch Verification ---");
+
+    let config_u8 = <FilterAddBench as ForType<u8>>::config();
+    let config_u16 = <FilterAddBench as ForType<u16>>::config();
+    let config_u32 = <FilterAddBench as ForType<u32>>::config();
+
+    println!(
+        "  ForType<u8>::config().type_name() = {}",
+        config_u8.type_name()
+    );
+    println!(
+        "  ForType<u16>::config().type_name() = {}",
+        config_u16.type_name()
+    );
+    println!(
+        "  ForType<u32>::config().type_name() = {}",
+        config_u32.type_name()
+    );
+
+    assert_eq!(config_u8.type_name(), "u8");
+    assert_eq!(config_u16.type_name(), "u16");
+    assert_eq!(config_u32.type_name(), "u32");
+    println!("  ✓ ForType trait dispatch PASSED");
+    println!();
+
+    // Verify TypeList registration order
+    println!("--- TypeList Registration Order ---");
+    let mut configs: Vec<Box<dyn ErasedConfig>> = Vec::new();
+    let mut type_names: Vec<&'static str> = Vec::new();
+    <(u8, u16, u32) as TypeList<FilterAddBench>>::register(&mut configs, &mut type_names);
+
+    println!("  Registration order: {:?}", type_names);
+    assert_eq!(type_names, vec!["u8", "u16", "u32"]);
+    println!("  ✓ TypeList registration order PASSED");
+    println!();
+
+    // Verify algorithm correctness across types
+    println!("--- Algorithm Correctness Across Types ---");
+    for &type_name in &["u8", "u16", "u32"] {
+        let config = &bench.configs[type_name];
+        let stats = FilterAddStats {
+            len: 1000,
+            density: 0.3,
+        };
+
+        // Run 5 seeds and verify outputs match
+        for seed in 0..5 {
+            let data = config.generate_erased(&stats, seed);
+            let r1 = config.run_variant_erased("add_then_filter", data.as_ref());
+            let r2 = config.run_variant_erased("filter_then_add", data.as_ref());
+            assert_eq!(
+                r1, r2,
+                "type={}, seed={}: output lengths differ",
+                type_name, seed
+            );
+        }
+        println!("  ✓ {} - 5 seeds verified", type_name);
+    }
+    println!();
+
+    println!("All verifications PASSED!");
+    println!();
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -459,8 +602,9 @@ fn main() {
 
     demo_type_erased();
     demo_bevy_style();
+    demo_verification();
 
-    println!("Done! Both approaches work.");
+    println!("Done! All demos and verifications passed.");
 }
 
 #[cfg(test)]
@@ -517,7 +661,10 @@ mod tests {
     fn test_erased_config() {
         let config = <FilterAddBench as ForType<u32>>::config();
         assert_eq!(config.type_name(), "u32");
-        assert_eq!(config.variant_names(), vec!["add_then_filter", "filter_then_add"]);
+        assert_eq!(
+            config.variant_names(),
+            vec!["add_then_filter", "filter_then_add"]
+        );
 
         let stats = FilterAddStats {
             len: 100,

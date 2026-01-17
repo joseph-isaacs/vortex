@@ -49,7 +49,53 @@ ThresholdBench::new("sum")
     .register(&mut registry);
 ```
 
-### 2. Trait API (For complex cases)
+### 2. Stats-Based API (Recommended for multi-dimensional benchmarks)
+
+```rust
+use vortex_threshold_traits::{StatsBench, StatsGrid, Scale, StatsPoint};
+
+StatsBench::<RankData, RankStats, usize>::new("rank")
+    .stats(RankStats::compute)
+    .generate(|stats: &RankStats, seed| stats.generate(seed))
+    .stats_grid(
+        StatsGrid::new()
+            .dimension("len", Scale::log2(6, 10))
+            .dimension("density", Scale::steps(0.0, 1.0, 3)),
+    )
+    .baseline("naive", rank_naive)
+    .variant("chunked", rank_chunked)
+    .build();
+```
+
+### 3. Generic Type API (Bevy-style, for type-generic benchmarks)
+
+```rust
+// Marker struct for the benchmark
+struct FilterAddBench;
+
+// Implement ForType<T> for each element type
+impl<T: Element> ForType<T> for FilterAddBench {
+    fn config() -> ConcreteConfig<T> {
+        ConcreteConfig {
+            _phantom: PhantomData,
+            baseline: ("add_then_filter", add_then_filter::<T>),
+            variants: vec![("filter_then_add", filter_then_add::<T>)],
+        }
+    }
+}
+
+// Build with for_types - type enumeration is INTERNAL
+let bench = UnifiedStatsBench::new("filter_add")
+    .len_values(vec![1024, 4096])
+    .density_values(vec![0.1, 0.5, 0.9])
+    .for_types::<FilterAddBench, (u8, u16, u32)>()  // Bevy-style tuple
+    .build();
+
+// Search runs over all (len, density, type) combinations
+bench.search();
+```
+
+### 4. Trait API (For complex cases)
 
 ```rust
 use vortex_threshold_traits::{BenchmarkableAlgorithm, ParameterScale, Variant};
@@ -123,15 +169,21 @@ GitHub Actions workflow (`.github/workflows/isa-thresholds.yml`) runs benchmarks
 ### Completed
 - [x] Core trait definitions (`BenchmarkableAlgorithm`)
 - [x] Builder API (`ThresholdBench`) - criterion-like ergonomics
-- [x] Parameter scales (Linear, Logarithmic, Explicit)
+- [x] Stats-based API (`StatsBench`) - multi-dimensional grid search
+- [x] Parameter scales (Linear, Logarithmic, Explicit, Steps)
 - [x] CPU feature detection and variant availability
 - [x] CPU class detection (Intel/AMD/ARM families)
 - [x] Grid search for crossover detection
 - [x] JSON output for CI artifact collection
 - [x] SQLite storage backend with query support
 - [x] GitHub Actions workflow template
-- [x] Example benchmarks (popcount, sum)
+- [x] Example benchmarks (popcount, sum, rank)
 - [x] Result aggregation and Rust code generation
+- [x] **Generic type support** - Bevy-style `for_types` API
+  - `ForType<T>` trait for type-specific config
+  - `TypeList` trait with tuple impls for type registration
+  - Type-erased internals (`ErasedData`, `ErasedConfig`) for search
+  - Working example: `generic_api_demo.rs`
 
 ### Not Yet Implemented
 - [ ] Binary search refinement for precise crossover points
@@ -139,6 +191,7 @@ GitHub Actions workflow (`.github/workflows/isa-thresholds.yml`) runs benchmarks
 - [ ] Automatic PR comments with threshold changes
 - [ ] Integration with actual Vortex algorithms (rank, select, etc.)
 - [ ] Dashboard/visualization for threshold trends
+- [ ] Per-variant parameter grid (`ParamGrid` derive macro)
 
 ## File Locations
 
@@ -148,7 +201,15 @@ vortex/
 │   ├── src/
 │   │   ├── lib.rs           # Core traits, CpuClass, ParameterScale
 │   │   ├── builder.rs       # ThresholdBench builder API
+│   │   ├── bench.rs         # StatsBench builder API (stats-based)
+│   │   ├── scale.rs         # Scale enum (log2, linear, steps, explicit)
+│   │   ├── stats.rs         # StatsGrid, StatsPoint
+│   │   ├── measure.rs       # Measurer, MeasurementResult
 │   │   └── storage.rs       # BenchmarkStorage trait
+│   ├── examples/
+│   │   ├── target_api.rs        # Rank benchmark using StatsBench
+│   │   ├── generic_api_demo.rs  # Generic type support (ForType, TypeList)
+│   │   └── filter_plus_api.rs   # API design doc (requires vortex_array)
 │   └── Cargo.toml
 │
 ├── vortex-threshold-runner/

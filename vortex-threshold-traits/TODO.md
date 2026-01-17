@@ -57,27 +57,84 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 
 ---
 
-## Phase 3: Per-Variant Parameters
+## Phase 3: Generic Type Support ✅ COMPLETE
 
-**Priority: MEDIUM** - Enables parameter tuning per variant
+**Priority: HIGH** - Enables benchmarks generic over element types
 
-- [ ] **3.1 Design `ParamGrid` trait**
-- [ ] **3.2 Implement `ParamGrid` derive macro** (new crate)
-- [ ] **3.3 Update `StatsBench` with `.variant_with_params::<P>()`**
+The problem: When benchmarking algorithms like filter+add that work with different element types (u8, u16, u32, u64), we want ONE StatsBench instance per piece of logic, not one per type. The type enumeration should be INTERNAL to the StatsBench.
+
+### Solution: Bevy-style `for_types` API
+
+- [x] **3.1 Type-erased traits**
+  - `ErasedData` - wrapper for type-erased data with `as_any()` for downcast
+  - `ErasedConfig` - type-erased config with `generate_erased()`, `run_variant_erased()`
+
+- [x] **3.2 ForType<T> trait pattern**
+  - Marker struct pattern (like Bevy's SystemParam)
+  - `impl<T: Element> ForType<T> for FilterAddBench { fn config() -> ConcreteConfig<T> }`
+  - No macros needed - trait impl provides type-specific config
+
+- [x] **3.3 TypeList trait with tuple impls**
+  - `impl<Marker, A, B, C> TypeList<Marker> for (A, B, C)`
+  - Registers configs for each type in the tuple
+  - Supports 1-4 types via tuple impls
+
+- [x] **3.4 Working example**
+  - See: `examples/generic_api_demo.rs`
+  - Demonstrates: type registration, type-erased search, verification
+  - Run: `cargo run --example generic_api_demo -p vortex-threshold-traits`
+
+### User-facing API
+
+```rust
+// 1. Define marker struct
+struct FilterAddBench;
+
+// 2. Implement ForType<T> for each element type
+impl<T: Element> ForType<T> for FilterAddBench {
+    fn config() -> ConcreteConfig<T> {
+        ConcreteConfig {
+            _phantom: PhantomData,
+            baseline: ("add_then_filter", add_then_filter::<T>),
+            variants: vec![("filter_then_add", filter_then_add::<T>)],
+        }
+    }
+}
+
+// 3. Build benchmark with for_types
+let bench = UnifiedStatsBench::new("filter_add")
+    .len_values(vec![1024, 4096])
+    .density_values(vec![0.1, 0.5, 0.9])
+    .for_types::<FilterAddBench, (u8, u16, u32)>()  // Bevy-style!
+    .build();
+
+// 4. Search runs over all (len, density, type) combinations
+bench.search();
+```
 
 ---
 
-## Phase 4: Two Modes (Bench vs Search) ⚠️ PARTIAL
+## Phase 4: Per-Variant Parameters
 
-- [x] **4.1 `BenchRunner`** - `.at()`, `.run()`, `.print()`
-- [x] **4.2 `SearchRunner`** - grid search, winners detection
-- [x] **4.3 Entry points** - `.bench()`, `.search()`
+**Priority: MEDIUM** - Enables parameter tuning per variant
+
+- [ ] **4.1 Design `ParamGrid` trait**
+- [ ] **4.2 Implement `ParamGrid` derive macro** (new crate)
+- [ ] **4.3 Update `StatsBench` with `.variant_with_params::<P>()`**
+
+---
+
+## Phase 5: Two Modes (Bench vs Search) ⚠️ PARTIAL
+
+- [x] **5.1 `BenchRunner`** - `.at()`, `.run()`, `.print()`
+- [x] **5.2 `SearchRunner`** - grid search, winners detection
+- [x] **5.3 Entry points** - `.bench()`, `.search()`
 - [ ] `.refine()` - binary search refinement
 - [ ] Crossover detection
 
 ---
 
-## Phase 5: Output & Display ⚠️ PARTIAL
+## Phase 6: Output & Display ⚠️ PARTIAL
 
 - [x] Basic terminal output with print()
 - [ ] Divan-style aligned columns
@@ -86,7 +143,7 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 
 ---
 
-## Phase 6-7: Refinement, Storage & CI
+## Phase 7: Refinement, Storage & CI
 
 - [ ] Binary search refinement
 - [ ] SQLite storage
@@ -101,11 +158,11 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 |-------|--------|-------|
 | 1. Measurement | **DONE** | `Measurer`, `BatchSize`, IQR, bootstrap CI |
 | 2. Stats API | **DONE** | `Scale`, `StatsGrid`, `StatsBench` builder |
-| 3. ParamGrid | Not started | No derive macro yet |
-| 4. Two Modes | **Partial** | Basic BenchRunner/SearchRunner work |
-| 5. Output | **Partial** | Basic print(), no JSON/save |
-| 6. Refinement | Not started | |
-| 7. Storage/CI | Not started | Trait exists only |
+| 3. Generic Types | **DONE** | Bevy-style `for_types`, `ForType<T>`, `TypeList` |
+| 4. ParamGrid | Not started | No derive macro yet |
+| 5. Two Modes | **Partial** | Basic BenchRunner/SearchRunner work |
+| 6. Output | **Partial** | Basic print(), no JSON/save |
+| 7. Refinement/CI | Not started | Trait exists only |
 
 ---
 
@@ -113,5 +170,16 @@ This tracks implementation progress against the design in `plan/`. The goal is a
 
 1. ~~**Phase 1** (Measurement) - DONE~~
 2. ~~**Phase 2** (Stats API) - DONE~~
-3. **Phase 3** (ParamGrid derive) - enables tunable per-variant params
-4. **Phase 5** (Output) - JSON export, better terminal display
+3. ~~**Phase 3** (Generic Types) - DONE~~
+4. **Phase 4** (ParamGrid derive) - enables tunable per-variant params
+5. **Phase 6** (Output) - JSON export, better terminal display
+
+---
+
+## Examples
+
+| Example | Description | Status |
+|---------|-------------|--------|
+| `target_api.rs` | Rank benchmark with StatsBench | Working |
+| `generic_api_demo.rs` | Generic type support with ForType trait | Working |
+| `filter_plus_api.rs` | API design document (requires vortex_array) | Design doc only |
