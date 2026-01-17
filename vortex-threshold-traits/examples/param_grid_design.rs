@@ -35,6 +35,24 @@ trait ParamGrid: Clone + Debug + Send + Sync + 'static {
 
     /// Get an extended grid for thorough testing
     fn thorough_grid() -> Vec<Self>;
+
+    /// Generate values using a custom generator function
+    /// Useful for dynamic parameter generation based on runtime conditions
+    fn generate<F>(f: F) -> Vec<Self>
+    where
+        F: FnOnce() -> Vec<Self>,
+    {
+        f()
+    }
+
+    /// Generate values from an iterator
+    fn from_iter<I, F>(iter: I, f: F) -> Vec<Self>
+    where
+        I: IntoIterator,
+        F: Fn(I::Item) -> Self,
+    {
+        iter.into_iter().map(f).collect()
+    }
 }
 
 // ============================================================================
@@ -763,6 +781,223 @@ impl ParamGrid for ConstrainedParams {
 }
 
 // ============================================================================
+// EXAMPLE 11: Generator-based parameters
+// ============================================================================
+
+/// Parameters generated dynamically at runtime
+///
+/// ```ignore
+/// #[derive(ParamGrid)]
+/// struct DynamicParams {
+///     #[param(generator = || {
+///         let cpu_cores = num_cpus::get();
+///         (1..=cpu_cores).collect()
+///     })]
+///     num_threads: usize,
+///
+///     #[param(generator = |num_threads| {
+///         // Cache size depends on thread count
+///         vec![1024 * num_threads, 2048 * num_threads, 4096 * num_threads]
+///     })]
+///     cache_size: usize,
+/// }
+/// ```
+#[derive(Clone, Debug)]
+struct DynamicParams {
+    num_threads: usize,
+    cache_size: usize,
+    batch_size: usize,
+}
+
+impl DynamicParams {
+    /// Generator that creates params based on system resources
+    fn system_aware_generator() -> Vec<Self> {
+        // Simulate detecting CPU cores (would use num_cpus crate in real code)
+        let cpu_cores = 4; // num_cpus::get()
+
+        // Simulate detecting available memory
+        let available_mb = 8192; // Would detect actual RAM
+
+        let thread_options: Vec<usize> = (1..=cpu_cores).collect();
+        let cache_options = vec![1024, 2048, 4096, 8192]
+            .into_iter()
+            .filter(|&c| c <= available_mb / 4)
+            .collect::<Vec<_>>();
+
+        let mut result = Vec::new();
+        for &num_threads in &thread_options {
+            for &cache_size in &cache_options {
+                // Batch size scales with threads
+                for batch_mult in [1, 2, 4] {
+                    result.push(Self {
+                        num_threads,
+                        cache_size,
+                        batch_size: 64 * num_threads * batch_mult,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// Generator for memory-constrained environments
+    fn low_memory_generator() -> Vec<Self> {
+        vec![
+            Self { num_threads: 1, cache_size: 512, batch_size: 32 },
+            Self { num_threads: 2, cache_size: 512, batch_size: 64 },
+            Self { num_threads: 1, cache_size: 1024, batch_size: 64 },
+        ]
+    }
+
+    /// Generator for high-performance environments
+    fn high_perf_generator() -> Vec<Self> {
+        let cores = 8; // Assume 8 cores
+        (4..=cores)
+            .flat_map(|threads| {
+                [4096, 8192, 16384].into_iter().map(move |cache| Self {
+                    num_threads: threads,
+                    cache_size: cache,
+                    batch_size: 256 * threads,
+                })
+            })
+            .collect()
+    }
+}
+
+impl ParamGrid for DynamicParams {
+    fn grid() -> Vec<Self> {
+        Self::system_aware_generator()
+    }
+
+    fn to_suffix(&self) -> String {
+        format!(
+            "threads={},cache={}K,batch={}",
+            self.num_threads,
+            self.cache_size / 1024,
+            self.batch_size
+        )
+    }
+
+    fn default_value() -> Self {
+        Self {
+            num_threads: 2,
+            cache_size: 2048,
+            batch_size: 128,
+        }
+    }
+
+    fn quick_grid() -> Vec<Self> {
+        vec![Self::default_value()]
+    }
+
+    fn thorough_grid() -> Vec<Self> {
+        Self::system_aware_generator()
+    }
+}
+
+// ============================================================================
+// EXAMPLE 12: Composable generators
+// ============================================================================
+
+/// Generators that can be combined
+#[derive(Clone, Debug)]
+struct ComposableParams {
+    value: usize,
+}
+
+impl ComposableParams {
+    /// Linear range generator
+    fn linear(start: usize, end: usize, steps: usize) -> Vec<Self> {
+        if steps <= 1 {
+            return vec![Self { value: start }];
+        }
+        (0..steps)
+            .map(|i| Self {
+                value: start + (end - start) * i / (steps - 1),
+            })
+            .collect()
+    }
+
+    /// Logarithmic range generator
+    fn log2_range(min_exp: u32, max_exp: u32) -> Vec<Self> {
+        (min_exp..=max_exp)
+            .map(|exp| Self { value: 1 << exp })
+            .collect()
+    }
+
+    /// Fibonacci sequence generator
+    fn fibonacci(count: usize) -> Vec<Self> {
+        let mut fibs = vec![1, 1];
+        while fibs.len() < count {
+            let next = fibs[fibs.len() - 1] + fibs[fibs.len() - 2];
+            fibs.push(next);
+        }
+        fibs.into_iter().take(count).map(|v| Self { value: v }).collect()
+    }
+
+    /// Prime numbers generator
+    fn primes(max: usize) -> Vec<Self> {
+        let mut is_prime = vec![true; max + 1];
+        is_prime[0] = false;
+        if max > 0 {
+            is_prime[1] = false;
+        }
+
+        for i in 2..=((max as f64).sqrt() as usize) {
+            if is_prime[i] {
+                for j in (i * i..=max).step_by(i) {
+                    is_prime[j] = false;
+                }
+            }
+        }
+
+        is_prime
+            .into_iter()
+            .enumerate()
+            .filter(|(_, p)| *p)
+            .map(|(v, _)| Self { value: v })
+            .collect()
+    }
+
+    /// Combine multiple generators, removing duplicates
+    fn combine(generators: Vec<Vec<Self>>) -> Vec<Self> {
+        let mut seen = std::collections::HashSet::new();
+        generators
+            .into_iter()
+            .flatten()
+            .filter(|p| seen.insert(p.value))
+            .collect()
+    }
+}
+
+impl ParamGrid for ComposableParams {
+    fn grid() -> Vec<Self> {
+        // Combine different generation strategies
+        Self::combine(vec![
+            Self::log2_range(0, 4),      // 1, 2, 4, 8, 16
+            Self::linear(1, 20, 5),       // 1, 5, 10, 15, 20
+            Self::fibonacci(6),           // 1, 1, 2, 3, 5, 8
+        ])
+    }
+
+    fn to_suffix(&self) -> String {
+        format!("v={}", self.value)
+    }
+
+    fn default_value() -> Self {
+        Self { value: 8 }
+    }
+
+    fn quick_grid() -> Vec<Self> {
+        Self::log2_range(2, 4) // 4, 8, 16
+    }
+
+    fn thorough_grid() -> Vec<Self> {
+        Self::linear(1, 32, 32) // Every value 1-32
+    }
+}
+
+// ============================================================================
 // DEMONSTRATION
 // ============================================================================
 
@@ -798,6 +1033,8 @@ fn main() {
     print_grid::<WeightedParams>("8. Weighted params");
     print_grid::<StrategyParams>("9. Enum-based");
     print_grid::<ConstrainedParams>("10. Range constraints");
+    print_grid::<DynamicParams>("11. Generator-based (system-aware)");
+    print_grid::<ComposableParams>("12. Composable generators");
 
     println!("===================================================");
     println!("Summary of ParamGrid options:");
@@ -813,6 +1050,14 @@ fn main() {
     println!("  #[param(if condition)]             - Conditional inclusion");
     println!("  #[param(preset_values = {{...}})]   - Named presets");
     println!("  #[param(all_variants)]             - All enum variants");
+    println!("  #[param(generator = || ...)]       - Dynamic generation");
+    println!();
+    println!("Generator methods:");
+    println!("  ParamGrid::generate(|| ...)        - Custom generator closure");
+    println!("  ParamGrid::from_iter(iter, f)      - From iterator + mapping");
+    println!("  Type::linear(start, end, steps)    - Linear range");
+    println!("  Type::log2_range(min, max)         - Log2 scale");
+    println!("  Type::combine(generators)          - Merge multiple generators");
 }
 
 #[cfg(test)]
@@ -851,5 +1096,52 @@ mod tests {
             assert!(p.tile_size.is_power_of_two());
             assert!((0.0..=1.0).contains(&p.dropout_rate));
         }
+    }
+
+    #[test]
+    fn test_dynamic_params_generators() {
+        let system = DynamicParams::system_aware_generator();
+        let low_mem = DynamicParams::low_memory_generator();
+        let high_perf = DynamicParams::high_perf_generator();
+
+        assert!(!system.is_empty());
+        assert!(!low_mem.is_empty());
+        assert!(!high_perf.is_empty());
+
+        // Low memory should have smaller values
+        for p in &low_mem {
+            assert!(p.cache_size <= 1024);
+        }
+    }
+
+    #[test]
+    fn test_composable_generators() {
+        let linear = ComposableParams::linear(0, 100, 11);
+        assert_eq!(linear.len(), 11);
+        assert_eq!(linear[0].value, 0);
+        assert_eq!(linear[10].value, 100);
+
+        let log2 = ComposableParams::log2_range(0, 4);
+        assert_eq!(log2.len(), 5);
+        assert_eq!(log2.iter().map(|p| p.value).collect::<Vec<_>>(), vec![1, 2, 4, 8, 16]);
+
+        let fibs = ComposableParams::fibonacci(6);
+        assert_eq!(fibs.iter().map(|p| p.value).collect::<Vec<_>>(), vec![1, 1, 2, 3, 5, 8]);
+
+        let primes = ComposableParams::primes(20);
+        assert_eq!(
+            primes.iter().map(|p| p.value).collect::<Vec<_>>(),
+            vec![2, 3, 5, 7, 11, 13, 17, 19]
+        );
+    }
+
+    #[test]
+    fn test_combine_generators() {
+        let combined = ComposableParams::combine(vec![
+            ComposableParams::linear(1, 5, 5),  // 1, 2, 3, 4, 5
+            ComposableParams::linear(3, 7, 5),  // 3, 4, 5, 6, 7
+        ]);
+        // Should deduplicate: 1, 2, 3, 4, 5, 6, 7
+        assert_eq!(combined.len(), 7);
     }
 }
