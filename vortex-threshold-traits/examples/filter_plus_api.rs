@@ -553,6 +553,423 @@ fn run_type_erased_benchmark() {
 
 */
 
+// ============================================================================
+// APPROACH 3: NON-TYPE-ERASED GENERIC API (Compile-time generics)
+// ============================================================================
+//
+// For cases where Data/Output ARE generic (not type-erased like ArrayRef),
+// we need a different approach. The algorithms are generic over T.
+//
+// Key insight: the search must still run over type-erased stuff internally,
+// but the USER-FACING API can be fully generic.
+//
+// ============================================================================
+
+/*
+// =============================================================================
+// DATA TYPES (generic over T)
+// =============================================================================
+
+#[derive(Clone)]
+struct FilterAddData<T> {
+    a: Vec<T>,
+    b: Vec<T>,
+    mask: Vec<bool>,
+}
+
+// Stats are NOT generic - they describe the data without knowing T
+#[derive(Clone, Debug)]
+struct FilterAddStats {
+    len: usize,
+    density: f64,
+}
+
+impl FilterAddStats {
+    /// Compute stats FROM data (Data -> Stats)
+    fn compute<T>(data: &FilterAddData<T>) -> Self {
+        let true_count = data.mask.iter().filter(|&&m| m).count();
+        Self {
+            len: data.a.len(),
+            density: true_count as f64 / data.a.len() as f64,
+        }
+    }
+}
+
+impl<T: Element> FilterAddData<T> {
+    /// Generate data matching stats (Stats -> Data)
+    fn generate(stats: &FilterAddStats, seed: u64) -> Self {
+        let mut rng = StdRng::seed_from_u64(seed);
+        Self {
+            a: (0..stats.len).map(|_| T::random(&mut rng)).collect(),
+            b: (0..stats.len).map(|_| T::random(&mut rng)).collect(),
+            mask: (0..stats.len).map(|_| rng.gen::<f64>() < stats.density).collect(),
+        }
+    }
+}
+
+// =============================================================================
+// ALGORITHMS (generic over T)
+// =============================================================================
+
+fn add_then_filter_generic<T: Element>(data: &FilterAddData<T>) -> Vec<T> {
+    let sum: Vec<T> = data.a.iter().zip(&data.b)
+        .map(|(a, b)| a.wrapping_add(*b))
+        .collect();
+    sum.into_iter().zip(&data.mask)
+        .filter(|(_, &m)| m)
+        .map(|(v, _)| v)
+        .collect()
+}
+
+fn filter_then_add_generic<T: Element>(data: &FilterAddData<T>) -> Vec<T> {
+    let a_filt: Vec<T> = data.a.iter().zip(&data.mask)
+        .filter(|(_, &m)| m).map(|(&v, _)| v).collect();
+    let b_filt: Vec<T> = data.b.iter().zip(&data.mask)
+        .filter(|(_, &m)| m).map(|(&v, _)| v).collect();
+    a_filt.iter().zip(&b_filt).map(|(a, b)| a.wrapping_add(*b)).collect()
+}
+
+// =============================================================================
+// TYPE-ERASED INTERNALS (what for_types produces for search)
+// =============================================================================
+
+use std::any::Any;
+
+/// Type-erased config - this is what we store internally
+trait ErasedConfig: Send + Sync {
+    fn type_name(&self) -> &'static str;
+    fn generate_erased(&self, stats: &FilterAddStats, seed: u64) -> Box<dyn ErasedData>;
+    fn run_variant_erased(&self, variant: &str, data: &dyn ErasedData) -> Box<dyn ErasedOutput>;
+    fn compute_stats_erased(&self, data: &dyn ErasedData) -> FilterAddStats;
+    fn variant_names(&self) -> Vec<&'static str>;
+}
+
+/// Type-erased data wrapper
+trait ErasedData: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Send + Sync + 'static> ErasedData for FilterAddData<T> {
+    fn as_any(&self) -> &dyn Any { self }
+}
+
+/// Type-erased output (for correctness checking)
+trait ErasedOutput: Send + Sync {
+    fn len(&self) -> usize;
+}
+
+impl<T: Send + Sync + 'static> ErasedOutput for Vec<T> {
+    fn len(&self) -> usize { self.len() }
+}
+
+/// Concrete config for a specific type T
+struct ConcreteConfig<T: Element> {
+    _phantom: std::marker::PhantomData<T>,
+    baseline: (&'static str, fn(&FilterAddData<T>) -> Vec<T>),
+    variants: Vec<(&'static str, fn(&FilterAddData<T>) -> Vec<T>)>,
+}
+
+impl<T: Element + Send + Sync + 'static> ErasedConfig for ConcreteConfig<T> {
+    fn type_name(&self) -> &'static str {
+        T::type_name()
+    }
+
+    fn generate_erased(&self, stats: &FilterAddStats, seed: u64) -> Box<dyn ErasedData> {
+        Box::new(FilterAddData::<T>::generate(stats, seed))
+    }
+
+    fn run_variant_erased(&self, variant: &str, data: &dyn ErasedData) -> Box<dyn ErasedOutput> {
+        let concrete: &FilterAddData<T> = data.as_any().downcast_ref().unwrap();
+
+        if variant == self.baseline.0 {
+            Box::new((self.baseline.1)(concrete))
+        } else {
+            for (name, f) in &self.variants {
+                if *name == variant {
+                    return Box::new(f(concrete));
+                }
+            }
+            Box::new((self.baseline.1)(concrete))
+        }
+    }
+
+    fn compute_stats_erased(&self, data: &dyn ErasedData) -> FilterAddStats {
+        let concrete: &FilterAddData<T> = data.as_any().downcast_ref().unwrap();
+        FilterAddStats::compute(concrete)
+    }
+
+    fn variant_names(&self) -> Vec<&'static str> {
+        let mut names = vec![self.baseline.0];
+        names.extend(self.variants.iter().map(|(n, _)| *n));
+        names
+    }
+}
+
+// =============================================================================
+// BEVY-STYLE API: Marker struct + ForType trait
+// =============================================================================
+
+/// Trait that knows how to configure a benchmark for type T
+trait ForType<T: Element> {
+    fn config() -> ConcreteConfig<T>;
+}
+
+/// Marker struct for filter_add benchmark
+struct FilterAddBench;
+
+impl<T: Element + Send + Sync + 'static> ForType<T> for FilterAddBench {
+    fn config() -> ConcreteConfig<T> {
+        ConcreteConfig {
+            _phantom: std::marker::PhantomData,
+            baseline: ("add_then_filter", add_then_filter_generic::<T>),
+            variants: vec![("filter_then_add", filter_then_add_generic::<T>)],
+        }
+    }
+}
+
+// =============================================================================
+// TYPE LIST TRAIT (tuple impls like Bevy)
+// =============================================================================
+
+trait TypeList<Marker> {
+    fn register(configs: &mut Vec<Box<dyn ErasedConfig>>, type_names: &mut Vec<&'static str>);
+}
+
+impl<Marker, A> TypeList<Marker> for (A,)
+where
+    A: Element + Send + Sync + 'static,
+    Marker: ForType<A>,
+{
+    fn register(configs: &mut Vec<Box<dyn ErasedConfig>>, type_names: &mut Vec<&'static str>) {
+        configs.push(Box::new(<Marker as ForType<A>>::config()));
+        type_names.push(A::type_name());
+    }
+}
+
+impl<Marker, A, B> TypeList<Marker> for (A, B)
+where
+    A: Element + Send + Sync + 'static,
+    B: Element + Send + Sync + 'static,
+    Marker: ForType<A> + ForType<B>,
+{
+    fn register(configs: &mut Vec<Box<dyn ErasedConfig>>, type_names: &mut Vec<&'static str>) {
+        configs.push(Box::new(<Marker as ForType<A>>::config()));
+        configs.push(Box::new(<Marker as ForType<B>>::config()));
+        type_names.push(A::type_name());
+        type_names.push(B::type_name());
+    }
+}
+
+impl<Marker, A, B, C> TypeList<Marker> for (A, B, C)
+where
+    A: Element + Send + Sync + 'static,
+    B: Element + Send + Sync + 'static,
+    C: Element + Send + Sync + 'static,
+    Marker: ForType<A> + ForType<B> + ForType<C>,
+{
+    fn register(configs: &mut Vec<Box<dyn ErasedConfig>>, type_names: &mut Vec<&'static str>) {
+        configs.push(Box::new(<Marker as ForType<A>>::config()));
+        configs.push(Box::new(<Marker as ForType<B>>::config()));
+        configs.push(Box::new(<Marker as ForType<C>>::config()));
+        type_names.push(A::type_name());
+        type_names.push(B::type_name());
+        type_names.push(C::type_name());
+    }
+}
+
+impl<Marker, A, B, C, D> TypeList<Marker> for (A, B, C, D)
+where
+    A: Element + Send + Sync + 'static,
+    B: Element + Send + Sync + 'static,
+    C: Element + Send + Sync + 'static,
+    D: Element + Send + Sync + 'static,
+    Marker: ForType<A> + ForType<B> + ForType<C> + ForType<D>,
+{
+    fn register(configs: &mut Vec<Box<dyn ErasedConfig>>, type_names: &mut Vec<&'static str>) {
+        configs.push(Box::new(<Marker as ForType<A>>::config()));
+        configs.push(Box::new(<Marker as ForType<B>>::config()));
+        configs.push(Box::new(<Marker as ForType<C>>::config()));
+        configs.push(Box::new(<Marker as ForType<D>>::config()));
+        type_names.push(A::type_name());
+        type_names.push(B::type_name());
+        type_names.push(C::type_name());
+        type_names.push(D::type_name());
+    }
+}
+
+// =============================================================================
+// UNIFIED BUILDER
+// =============================================================================
+
+use std::collections::HashMap;
+
+struct UnifiedStatsBench {
+    name: String,
+    len_range: (usize, usize),      // (min, max) as log2
+    density_steps: usize,
+    configs: HashMap<String, Box<dyn ErasedConfig>>,
+    type_names: Vec<&'static str>,
+}
+
+impl UnifiedStatsBench {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            len_range: (10, 17),
+            density_steps: 5,
+            configs: HashMap::new(),
+            type_names: Vec::new(),
+        }
+    }
+
+    fn len_range(mut self, min_log2: usize, max_log2: usize) -> Self {
+        self.len_range = (min_log2, max_log2);
+        self
+    }
+
+    fn density_steps(mut self, steps: usize) -> Self {
+        self.density_steps = steps;
+        self
+    }
+
+    /// Register benchmark configs for multiple types (Bevy-style)
+    fn for_types<Marker, Types>(mut self) -> Self
+    where
+        Types: TypeList<Marker>,
+    {
+        let mut configs = Vec::new();
+        let mut type_names = Vec::new();
+        Types::register(&mut configs, &mut type_names);
+
+        for (config, name) in configs.into_iter().zip(type_names.iter()) {
+            self.configs.insert(name.to_string(), config);
+        }
+        self.type_names = type_names;
+        self
+    }
+
+    fn build(self) -> BuiltUnifiedBench {
+        BuiltUnifiedBench {
+            name: self.name,
+            len_range: self.len_range,
+            density_steps: self.density_steps,
+            configs: self.configs,
+            type_names: self.type_names,
+        }
+    }
+}
+
+struct BuiltUnifiedBench {
+    name: String,
+    len_range: (usize, usize),
+    density_steps: usize,
+    configs: HashMap<String, Box<dyn ErasedConfig>>,
+    type_names: Vec<&'static str>,
+}
+
+impl BuiltUnifiedBench {
+    /// Run search over all (len, density, elem_type) combinations
+    fn search(&self) {
+        println!("Search: {}", self.name);
+        println!("=========");
+
+        // Generate grid points
+        let lens: Vec<usize> = (self.len_range.0..=self.len_range.1)
+            .map(|exp| 1 << exp)
+            .collect();
+
+        let densities: Vec<f64> = (0..=self.density_steps)
+            .map(|i| i as f64 / self.density_steps as f64)
+            .collect();
+
+        println!("Grid: {} lens × {} densities × {} types = {} points",
+            lens.len(), densities.len(), self.type_names.len(),
+            lens.len() * densities.len() * self.type_names.len());
+        println!();
+
+        // For each grid point
+        for &type_name in &self.type_names {
+            let config = self.configs.get(type_name).unwrap();
+
+            for &len in &lens {
+                for &density in &densities {
+                    let stats = FilterAddStats { len, density };
+
+                    // Generate type-erased data
+                    let data = config.generate_erased(&stats, 42);
+
+                    // Run each variant
+                    let mut best_variant = "";
+                    let mut best_time = f64::MAX;
+
+                    for variant in config.variant_names() {
+                        // Measure (simplified - real impl would use proper measurement)
+                        let start = std::time::Instant::now();
+                        for _ in 0..10 {
+                            let _ = config.run_variant_erased(variant, data.as_ref());
+                        }
+                        let elapsed = start.elapsed().as_nanos() as f64 / 10.0;
+
+                        if elapsed < best_time {
+                            best_time = elapsed;
+                            best_variant = variant;
+                        }
+                    }
+
+                    println!("  (len={:>6}, density={:.2}, type={:>3}) -> {} ({:.0} ns)",
+                        len, density, type_name, best_variant, best_time);
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// USAGE EXAMPLE
+// =============================================================================
+
+fn run_unified_benchmark() {
+    let bench = UnifiedStatsBench::new("filter_add")
+        .len_range(10, 12)   // 1K to 4K (small for demo)
+        .density_steps(2)    // 0%, 50%, 100%
+        .for_types::<FilterAddBench, (u8, u16, u32)>()
+        .build();
+
+    bench.search();
+}
+
+// =============================================================================
+// SUMMARY: Three approaches for type genericity
+// =============================================================================
+//
+// 1. TYPE-ERASED (ArrayRef):
+//    - Data is already type-erased (Vortex ArrayRef)
+//    - Algorithms work on ArrayRef, no generics needed
+//    - Add "ptype" as a grid dimension
+//    - Match on ptype in generate()
+//    - BEST FOR: Vortex-specific benchmarks
+//
+// 2. GENERIC with for_types (Bevy-style):
+//    - Data/Output are generic over T
+//    - User writes marker struct + ForType<T> impl
+//    - for_types::<Marker, (T1, T2, T3)>() registers all types
+//    - Internally type-erased for search
+//    - BEST FOR: Non-Vortex benchmarks, reusable logic
+//
+// 3. SINGLE TYPE (no generics):
+//    - StatsBench<D, S, O> with fixed types
+//    - Simplest case
+//    - BEST FOR: One-off benchmarks
+//
+// The unified builder supports all three via:
+//    .typed::<D, S, O>()                      // single type
+//    .for_types::<Marker, (T1, T2, T3)>()     // multi-type generic
+//    .ptype_dimension(...)                     // type-erased
+//
+// ============================================================================
+
+*/
+
 fn main() -> VortexResult<()> {
     println!("Filter/Plus Optimization Benchmark (Vortex Arrays)");
     println!("===================================================");
