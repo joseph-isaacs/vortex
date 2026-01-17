@@ -182,4 +182,5 @@ bench.search();
 |---------|-------------|--------|
 | `target_api.rs` | Rank benchmark with StatsBench | Working |
 | `generic_api_demo.rs` | Generic type support with ForType trait | Working |
+| `full_api_demo.rs` | Complete demo: distributions, stats, types, params | Working |
 | `filter_plus_api.rs` | API design document (requires vortex_array) | Design doc only |
