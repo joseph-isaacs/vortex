@@ -10661,6 +10661,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-sampling"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.2",
+]
+
+[[package]]
 name = "vortex-scalar"
 version = "0.1.0"
 dependencies = [

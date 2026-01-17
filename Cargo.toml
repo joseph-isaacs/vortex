@@ -24,6 +24,7 @@ members = [
     "vortex-metrics",
     "vortex-proto",
     "vortex-python",
+    "vortex-sampling",
     "vortex-scan",
     "vortex-scalar",
     "vortex-session",
