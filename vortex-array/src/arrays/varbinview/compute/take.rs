@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::iter;
-use std::ops::Deref;
+use std::ptr;
 
 use num_traits::AsPrimitive;
 use vortex_buffer::Buffer;
+use vortex_buffer::BufferMut;
 use vortex_dtype::match_each_integer_ptype;
 use vortex_error::VortexResult;
 use vortex_mask::AllOr;
@@ -55,33 +55,97 @@ impl TakeKernel for VarBinViewVTable {
 
 register_kernel!(TakeKernelAdapter(VarBinViewVTable).lift());
 
+/// Optimized take implementation for BinaryView arrays.
+///
+/// This implementation uses direct pointer writes instead of iterator-based collection
+/// to minimize function call overhead. BinaryView is exactly 16 bytes (128 bits),
+/// which allows efficient copying via `ptr::copy_nonoverlapping`.
 fn take_views<I: AsPrimitive<usize>>(
     views: &Buffer<BinaryView>,
     indices: &[I],
     mask: &Mask,
 ) -> Buffer<BinaryView> {
-    // NOTE(ngates): this deref is not actually trivial, so we run it once.
-    let views_ref = views.deref();
-    // We do not use iter_bools directly, since the resulting dyn iterator cannot
-    // implement TrustedLen.
-    match mask.bit_buffer() {
-        AllOr::All => {
-            Buffer::<BinaryView>::from_trusted_len_iter(indices.iter().map(|i| views_ref[i.as_()]))
-        }
-        AllOr::None => Buffer::<BinaryView>::from_trusted_len_iter(iter::repeat_n(
-            BinaryView::default(),
-            indices.len(),
-        )),
-        AllOr::Some(buffer) => Buffer::<BinaryView>::from_trusted_len_iter(
-            buffer.iter().zip(indices.iter()).map(|(valid, idx)| {
-                if valid {
-                    views_ref[idx.as_()]
-                } else {
-                    BinaryView::default()
-                }
-            }),
-        ),
+    let len = indices.len();
+    if len == 0 {
+        return Buffer::empty();
     }
+
+    // Get a direct slice reference to the views - this deref is not trivial, so we do it once.
+    let views_slice = views.as_slice();
+
+    match mask.bit_buffer() {
+        AllOr::All => take_views_all_valid(views_slice, indices),
+        AllOr::None => {
+            // All indices are invalid, return a buffer of default (empty) views.
+            BufferMut::full(BinaryView::default(), len).freeze()
+        }
+        AllOr::Some(validity_buffer) => {
+            take_views_with_validity(views_slice, indices, validity_buffer)
+        }
+    }
+}
+
+/// Fast path: all indices are valid, use direct pointer writes.
+#[inline]
+fn take_views_all_valid<I: AsPrimitive<usize>>(
+    views: &[BinaryView],
+    indices: &[I],
+) -> Buffer<BinaryView> {
+    let len = indices.len();
+    let mut buffer = BufferMut::<BinaryView>::with_capacity(len);
+    let spare = buffer.spare_capacity_mut();
+    let src_ptr = views.as_ptr();
+
+    // Process indices with direct pointer writes.
+    // BinaryView is 16 bytes (128 bits), Copy, and repr(C) aligned to 16 bytes,
+    // making it efficient to copy with ptr::copy_nonoverlapping.
+    for (i, idx) in indices.iter().enumerate() {
+        let src_idx = idx.as_();
+        // SAFETY:
+        // - src_ptr.add(src_idx) is valid because indices are within bounds of views
+        // - spare[i] is valid because we allocated `len` capacity
+        // - BinaryView is Copy so no drop concerns
+        unsafe {
+            ptr::copy_nonoverlapping(src_ptr.add(src_idx), spare[i].as_mut_ptr(), 1);
+        }
+    }
+
+    // SAFETY: We initialized exactly `len` elements above.
+    unsafe { buffer.set_len(len) };
+    buffer.freeze()
+}
+
+/// Slow path: some indices may be invalid, check validity for each.
+#[inline]
+fn take_views_with_validity<I: AsPrimitive<usize>>(
+    views: &[BinaryView],
+    indices: &[I],
+    validity_buffer: &vortex_buffer::BitBuffer,
+) -> Buffer<BinaryView> {
+    let len = indices.len();
+    let mut buffer = BufferMut::<BinaryView>::with_capacity(len);
+    let spare = buffer.spare_capacity_mut();
+    let src_ptr = views.as_ptr();
+    let default_view = BinaryView::default();
+
+    // Iterate through validity bits and indices together.
+    for (i, (valid, idx)) in validity_buffer.iter().zip(indices.iter()).enumerate() {
+        // SAFETY:
+        // - spare[i] is valid because we allocated `len` capacity
+        // - src_ptr.add(idx.as_()) is valid when valid is true (indices within bounds)
+        // - BinaryView is Copy so no drop concerns
+        unsafe {
+            if valid {
+                ptr::copy_nonoverlapping(src_ptr.add(idx.as_()), spare[i].as_mut_ptr(), 1);
+            } else {
+                spare[i].write(default_view);
+            }
+        }
+    }
+
+    // SAFETY: We initialized exactly `len` elements above.
+    unsafe { buffer.set_len(len) };
+    buffer.freeze()
 }
 
 #[cfg(test)]
