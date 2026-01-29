@@ -196,9 +196,127 @@ LLVM's auto-vectorization already handles `slice::fill` well. Explicit SIMD woul
 - `encodings/runend/benches/run_end_decode.rs` - Comprehensive benchmarks
 - `encodings/runend/Cargo.toml` - Added benchmark entry
 
-## Future Work
+## Benchmark Results: Primitive Distributions (1M elements)
 
-1. **Primitive distribution benchmarks**: Test with sparse values, constant runs, etc.
-2. **Value-based optimizations**: Detect constant values for primitive decode
-3. **Memory prefetching**: For very large arrays (>1MB)
-4. **Non-temporal stores**: For large fills that exceed cache
+### Constant Value Distribution
+| Type | Avg Run 8 | Avg Run 64 | Avg Run 1024 | Avg Run 10000 |
+|------|-----------|------------|--------------|---------------|
+| u8   | 310 µs    | 58 µs      | 27 µs        | 22 µs         |
+| u32  | 259 µs    | 157 µs     | 155 µs       | 156 µs        |
+| u64  | 401 µs    | 331 µs     | 326 µs       | 327 µs        |
+
+### Sparse Non-Zero (90% zeros)
+| Type | Avg Run 8 | Avg Run 64 | Avg Run 1024 | Avg Run 10000 |
+|------|-----------|------------|--------------|---------------|
+| u8   | 310 µs    | 59 µs      | 22 µs        | 22 µs         |
+| u32  | 261 µs    | 157 µs     | 157 µs       | 156 µs        |
+| u64  | 398 µs    | 328 µs     | 322 µs       | 327 µs        |
+
+**Insight**: Performance is consistent across distributions - the current implementation doesn't benefit from skipping zero values. This is an optimization opportunity.
+
+## Future Optimization Recommendations
+
+Based on research from specialized agents targeting different scenarios:
+
+### 1. Sparse Zero Optimization (High Priority)
+
+**Current State**: Fills all runs including zeros.
+**Optimization**: Use `BufferMut::zeroed()` + skip zero fills.
+
+```rust
+// If >50% of runs are zeros, switch strategy
+let zero_count = values.iter().filter(|&&v| v == T::default()).count();
+if zero_count * 2 > values.len() {
+    let mut decoded = BufferMut::zeroed(length);  // OS lazy allocation
+    for (end, value) in run_ends.zip_eq(values) {
+        if *value != T::default() && end > current_pos {
+            decoded_slice[current_pos..end].fill(*value);
+        }
+        current_pos = end;
+    }
+}
+```
+
+**Expected Gain**: 20-50% for sparse data (90% zeros).
+
+### 2. Constant Value Detection (Medium Priority)
+
+**Optimization**: If all run values are identical, use single memset.
+
+```rust
+let first = values[0];
+if values.iter().all(|&v| v == first) {
+    decoded_slice.fill(first);  // Single memset, no loop
+    return PrimitiveArray::new(decoded, ...);
+}
+```
+
+**Expected Gain**: 10-30% for constant arrays.
+
+### 3. Run Length Classification (Medium Priority)
+
+For short runs (8-64), reduce per-run overhead:
+
+```rust
+match run_len {
+    0..=8 => fill_tiny(slice, val),     // Manual unroll
+    9..=64 => fill_small(slice, val),   // Inline SIMD
+    _ => slice.fill(val),               // Standard path
+}
+```
+
+**Expected Gain**: 15-40% for short runs.
+
+### 4. Non-Temporal Stores (Low Priority - Specialized)
+
+For very long runs (>1MB), avoid cache pollution:
+
+```rust
+#[cfg(target_arch = "x86_64")]
+unsafe fn fill_nontemporal(slice: &mut [u64], value: u64) {
+    let broadcast = _mm256_set1_epi64x(value as i64);
+    for chunk in slice.chunks_exact_mut(4) {
+        _mm256_stream_si256(chunk.as_mut_ptr() as *mut __m256i, broadcast);
+    }
+    _mm_sfence();
+}
+```
+
+**Expected Gain**: 20-40% for >1MB fills. Only beneficial for extremely long runs.
+
+### 5. Small Type SIMD (u8) (Low Priority - Specialized)
+
+For u8 with medium runs (64-512 bytes):
+
+```rust
+#[cfg(target_arch = "x86_64")]
+unsafe fn fill_u8_avx2(slice: &mut [u8], value: u8) {
+    let broadcast = _mm256_set1_epi8(value as i8);
+    for chunk in slice.chunks_exact_mut(32) {
+        _mm256_storeu_si256(chunk.as_mut_ptr() as *mut __m256i, broadcast);
+    }
+    // Handle remainder...
+}
+```
+
+**Expected Gain**: 10-30% for u8 with 64-512 byte runs. LLVM auto-vectorization already handles this well.
+
+## Priority Ranking
+
+| Priority | Optimization | Expected Gain | Complexity | When to Use |
+|----------|--------------|---------------|------------|-------------|
+| 1 | Sparse Zero | 20-50% | Low | >50% zero runs |
+| 2 | Constant Detection | 10-30% | Low | Constant arrays |
+| 3 | Run Length Classification | 15-40% | Medium | Many short runs |
+| 4 | Non-Temporal Stores | 20-40% | Medium | >1MB fills |
+| 5 | Small Type SIMD | 10-30% | High | u8 with 64-512B runs |
+
+## Key Insight
+
+**LLVM auto-vectorization already does an excellent job** with `slice::fill`. The main optimization opportunities are:
+
+1. **Avoiding unnecessary work** (sparse zeros, constant values)
+2. **Reducing per-run overhead** (run length classification)
+3. **Specialized paths for extreme cases** (non-temporal for huge fills)
+
+Focus on correctness and maintainability first. Only add complex optimizations when benchmarks prove significant gains.
