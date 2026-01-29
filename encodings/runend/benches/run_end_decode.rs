@@ -624,6 +624,104 @@ fn decode_bool_large(bencher: Bencher, (total_length, avg_run_length): (usize, u
 }
 
 // ============================================================================
+// Constant value optimization benchmarks
+// ============================================================================
+// These benchmarks specifically test the constant value fast path optimization
+// which uses a single fill() call instead of per-run fills when all values are identical.
+
+/// Benchmark args for constant value optimization comparison
+/// Format: (total_length, num_runs)
+const CONSTANT_OPT_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 10),      // 10 runs of 100K each
+    (1_000_000, 100),     // 100 runs of 10K each
+    (1_000_000, 1000),    // 1K runs of 1K each
+    (1_000_000, 10000),   // 10K runs of 100 each
+    (1_000_000, 100000),  // 100K runs of 10 each
+    (1_000_000, 1000000), // 1M runs of 1 each
+];
+
+/// Creates constant value test data (all values are 42)
+fn create_constant_value_data<T>(
+    total_length: usize,
+    num_runs: usize,
+) -> (PrimitiveArray, PrimitiveArray)
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let mut ends = BufferMut::<u32>::with_capacity(num_runs);
+    let mut values = BufferMut::<T>::with_capacity(num_runs);
+
+    let run_length = total_length / num_runs;
+    let mut pos = 0usize;
+
+    for i in 0..num_runs {
+        pos += if i == num_runs - 1 {
+            total_length - pos
+        } else {
+            run_length
+        };
+        ends.push(pos as u32);
+        values.push(<T as From<u8>>::from(42u8)); // All same value
+    }
+
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), Validity::NonNullable),
+    )
+}
+
+/// Creates non-constant value test data (values alternate between 0 and 255)
+fn create_non_constant_value_data<T>(
+    total_length: usize,
+    num_runs: usize,
+) -> (PrimitiveArray, PrimitiveArray)
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let mut ends = BufferMut::<u32>::with_capacity(num_runs);
+    let mut values = BufferMut::<T>::with_capacity(num_runs);
+
+    let run_length = total_length / num_runs;
+    let mut pos = 0usize;
+
+    for i in 0..num_runs {
+        pos += if i == num_runs - 1 {
+            total_length - pos
+        } else {
+            run_length
+        };
+        ends.push(pos as u32);
+        // Alternating values to ensure non-constant
+        values.push(<T as From<u8>>::from(if i % 2 == 0 { 0u8 } else { 255u8 }));
+    }
+
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), Validity::NonNullable),
+    )
+}
+
+/// Benchmark constant value decoding (uses fast path with single fill)
+#[divan::bench(types = [u32, u64], args = CONSTANT_OPT_ARGS)]
+fn decode_constant_values<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_constant_value_data::<T>(total_length, num_runs);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark non-constant value decoding (uses normal per-run fill path)
+#[divan::bench(types = [u32, u64], args = CONSTANT_OPT_ARGS)]
+fn decode_non_constant_values<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_non_constant_value_data::<T>(total_length, num_runs);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
 // Variable run length benchmarks (simulating real-world irregular patterns)
 // ============================================================================
 
@@ -677,5 +775,96 @@ fn decode_primitive_variable_runs<T>(
     T: Clone + Default + NativePType + From<u8>,
 {
     let (ends, values) = create_variable_run_data::<T>(total_length, avg_run_length);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Sparse zero optimization benchmarks
+// ============================================================================
+// These benchmarks compare the performance of decoding data with different
+// proportions of zero values. When >50% of run values are zero, we use a
+// zeroed buffer and skip zero fills during decoding.
+
+/// Benchmark args for sparse zero optimization: (total_length, num_runs, zero_percentage)
+const SPARSE_ZERO_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 100),   // 100 runs of 10K each
+    (1_000_000, 1000),  // 1K runs of 1K each
+    (1_000_000, 10000), // 10K runs of 100 each
+];
+
+/// Creates sparse data with a given percentage of zeros
+fn create_sparse_data<T>(
+    total_length: usize,
+    num_runs: usize,
+    zero_percentage: usize, // 0-100
+) -> (PrimitiveArray, PrimitiveArray)
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let mut ends = BufferMut::<u32>::with_capacity(num_runs);
+    let mut values = BufferMut::<T>::with_capacity(num_runs);
+
+    let run_length = total_length / num_runs;
+    let mut pos = 0usize;
+
+    for i in 0..num_runs {
+        pos += if i == num_runs - 1 {
+            total_length - pos
+        } else {
+            run_length
+        };
+        ends.push(pos as u32);
+        // Deterministic pattern: first zero_percentage% runs are zeros
+        let is_zero = (i * 100 / num_runs) < zero_percentage;
+        values.push(if is_zero {
+            T::default()
+        } else {
+            <T as From<u8>>::from(((i % 255) + 1) as u8)
+        });
+    }
+
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), Validity::NonNullable),
+    )
+}
+
+/// Benchmark sparse data with 90% zeros (triggers sparse zero optimization)
+#[divan::bench(types = [u32, u64], args = SPARSE_ZERO_ARGS)]
+fn decode_sparse_90_percent_zeros<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_sparse_data::<T>(total_length, num_runs, 90);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark sparse data with 60% zeros (triggers sparse zero optimization)
+#[divan::bench(types = [u32, u64], args = SPARSE_ZERO_ARGS)]
+fn decode_sparse_60_percent_zeros<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_sparse_data::<T>(total_length, num_runs, 60);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark data with 50% zeros (boundary case - does NOT trigger optimization)
+#[divan::bench(types = [u32, u64], args = SPARSE_ZERO_ARGS)]
+fn decode_50_percent_zeros<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_sparse_data::<T>(total_length, num_runs, 50);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark dense data with 10% zeros (does NOT trigger sparse optimization)
+#[divan::bench(types = [u32, u64], args = SPARSE_ZERO_ARGS)]
+fn decode_dense_10_percent_zeros<T>(bencher: Bencher, (total_length, num_runs): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_sparse_data::<T>(total_length, num_runs, 10);
     bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
 }

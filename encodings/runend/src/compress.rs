@@ -26,6 +26,31 @@ use vortex_scalar::Scalar;
 use crate::iter::trimmed_ends_iter;
 
 // ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Checks if all values in the slice are identical.
+/// Returns true for empty slices.
+#[inline(always)]
+fn is_constant_value<T: PartialEq>(values: &[T]) -> bool {
+    match values.first() {
+        Some(first) => values.iter().all(|v| v == first),
+        None => true,
+    }
+}
+
+/// Returns true if more than half of the values are zero.
+///
+/// This is used to determine whether to use a zeroed buffer optimization
+/// where we pre-fill with zeros and skip zero-value fills during decoding.
+#[inline(always)]
+fn is_mostly_zeros<T: NativePType>(values: &[T]) -> bool {
+    let zero = T::default();
+    let zero_count = values.iter().filter(|&&v| v == zero).count();
+    zero_count * 2 > values.len()
+}
+
+// ============================================================================
 // Original implementation (for benchmarking comparison)
 // ============================================================================
 
@@ -238,6 +263,43 @@ pub fn runend_decode_typed_primitive<T: NativePType>(
 ) -> PrimitiveArray {
     match values_validity {
         Mask::AllTrue(_) => {
+            // Fast path: all values are identical - use a single fill
+            if let Some(&first_value) = values.first()
+                && is_constant_value(values)
+            {
+                let mut decoded: BufferMut<T> = BufferMut::with_capacity(length);
+                // SAFETY: We will initialize all elements via fill before returning
+                unsafe { decoded.set_len(length) };
+                decoded.as_mut_slice().fill(first_value);
+                return PrimitiveArray::new(decoded.freeze(), values_nullability.into());
+            }
+
+            // Sparse zero optimization: if >50% of run values are zero,
+            // use a zeroed buffer and skip zero fills
+            if is_mostly_zeros(values) {
+                let mut decoded: BufferMut<T> = BufferMut::zeroed(length);
+                let decoded_slice = decoded.as_mut_slice();
+                let mut current_pos = 0usize;
+                let zero = T::default();
+
+                for (end, value) in run_ends.zip_eq(values) {
+                    debug_assert!(
+                        end <= length,
+                        "Runend end must be less than or equal to overall length"
+                    );
+                    // Skip runs that are entirely before the current position
+                    // (can happen with offset when runs end before the view starts)
+                    if end > current_pos {
+                        // Only fill non-zero values (zeros are already set)
+                        if *value != zero {
+                            decoded_slice[current_pos..end].fill(*value);
+                        }
+                        current_pos = end;
+                    }
+                }
+                return PrimitiveArray::new(decoded, values_nullability.into());
+            }
+
             // Pre-allocate buffer capacity, then fill using slice::fill
             // which the compiler can vectorize more efficiently than per-element writes
             let mut decoded: BufferMut<T> = BufferMut::with_capacity(length);
@@ -664,6 +726,171 @@ mod test {
 
         let expected =
             BoolArray::from(BitBuffer::from(vec![false, false, false, true, true, true]));
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    // ============================================================================
+    // Constant value detection tests for primitive decode
+    // ============================================================================
+
+    #[test]
+    fn decode_constant_value_all_42s() {
+        // All runs have the same value (42) - should trigger the constant value fast path
+        let ends = PrimitiveArray::from_iter([3u32, 7, 10]);
+        let values = PrimitiveArray::from_iter([42i32, 42, 42]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let expected = PrimitiveArray::from_iter(vec![42i32; 10]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_constant_value_single_run() {
+        // Single run with constant value
+        let ends = PrimitiveArray::from_iter([10u32]);
+        let values = PrimitiveArray::from_iter([42i32]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let expected = PrimitiveArray::from_iter(vec![42i32; 10]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_non_constant_values() {
+        // Non-constant values - should use normal path
+        let ends = PrimitiveArray::from_iter([3u32, 7, 10]);
+        let values = PrimitiveArray::from_iter([1i32, 2, 3]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let expected = PrimitiveArray::from_iter(vec![1i32, 1, 1, 2, 2, 2, 2, 3, 3, 3]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_empty_values_array() {
+        // Edge case: empty values array (length 0)
+        let ends = PrimitiveArray::from_iter(Vec::<u32>::new());
+        let values = PrimitiveArray::from_iter(Vec::<i32>::new());
+        let decoded = runend_decode_primitive(ends, values, 0, 0);
+
+        let expected = PrimitiveArray::from_iter(Vec::<i32>::new());
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_constant_value_with_offset() {
+        // Constant values with offset - should still work correctly
+        // Full array: [42, 42, 42, 42, 42, 42, 42, 42, 42, 42]
+        // With offset 2, length 6: [42, 42, 42, 42, 42, 42]
+        let ends = PrimitiveArray::from_iter([3u32, 7, 10]);
+        let values = PrimitiveArray::from_iter([42i32, 42, 42]);
+        let decoded = runend_decode_primitive(ends, values, 2, 6);
+
+        let expected = PrimitiveArray::from_iter(vec![42i32; 6]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    // ============================================================================
+    // Sparse zero optimization tests for primitive decode
+    // ============================================================================
+
+    #[test]
+    fn decode_sparse_data_mostly_zeros() {
+        // Sparse data with 90% zeros (9 out of 10 runs are zeros)
+        // This should trigger the sparse zero optimization path
+        // Pattern: [0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let ends = PrimitiveArray::from_iter([
+            1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ]);
+        let values = PrimitiveArray::from_iter([
+            0i32, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let decoded = runend_decode_primitive(ends, values, 0, 20);
+
+        let mut expected_data = vec![0i32; 20];
+        expected_data[9] = 42;
+        let expected = PrimitiveArray::from_iter(expected_data);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_dense_data_mostly_nonzero() {
+        // Dense data with only 10% zeros (1 out of 10 runs are zeros)
+        // This should NOT trigger the sparse zero optimization path
+        // Pattern: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+        let ends = PrimitiveArray::from_iter([1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let values = PrimitiveArray::from_iter([1i32, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let expected = PrimitiveArray::from_iter(vec![1i32, 2, 3, 4, 5, 6, 7, 8, 9, 0]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_sparse_with_long_runs() {
+        // Sparse data with long runs - 90% zeros (9 runs of 10 each = 90 zeros, 1 run = 10 non-zeros)
+        // Total: 100 elements, 9 zero runs of length 10 each, 1 non-zero run of length 10
+        let ends = PrimitiveArray::from_iter([10u32, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+        let values = PrimitiveArray::from_iter([0i32, 0, 0, 0, 42, 0, 0, 0, 0, 0]);
+        let decoded = runend_decode_primitive(ends, values, 0, 100);
+
+        let mut expected_data = vec![0i32; 100];
+        for i in 40..50 {
+            expected_data[i] = 42;
+        }
+        let expected = PrimitiveArray::from_iter(expected_data);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_exactly_50_percent_zeros() {
+        // Exactly 50% zeros (5 zeros, 5 non-zeros) - should NOT trigger sparse optimization
+        // because we require >50%, not >=50%
+        let ends = PrimitiveArray::from_iter([1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let values = PrimitiveArray::from_iter([0i32, 1, 0, 2, 0, 3, 0, 4, 0, 5]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let expected = PrimitiveArray::from_iter(vec![0i32, 1, 0, 2, 0, 3, 0, 4, 0, 5]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_sparse_with_offset() {
+        // Sparse data with offset
+        // Full array (10 runs): [0, 0, 0, 0, 0, 42, 0, 0, 0, 0] - 90% zeros
+        // With offset 3, length 4: [0, 0, 42, 0]
+        let ends = PrimitiveArray::from_iter([1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let values = PrimitiveArray::from_iter([0i32, 0, 0, 0, 0, 42, 0, 0, 0, 0]);
+        let decoded = runend_decode_primitive(ends, values, 3, 4);
+
+        let expected = PrimitiveArray::from_iter(vec![0i32, 0, 42, 0]);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_sparse_u64_type() {
+        // Test sparse optimization with u64 type (larger element size)
+        let ends = PrimitiveArray::from_iter([1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let values = PrimitiveArray::from_iter([0u64, 0, 0, 0, 0, 0, 0, 0, 0, 42]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let mut expected_data = vec![0u64; 10];
+        expected_data[9] = 42;
+        let expected = PrimitiveArray::from_iter(expected_data);
+        assert_arrays_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn decode_sparse_f64_type() {
+        // Test sparse optimization with f64 type
+        let ends = PrimitiveArray::from_iter([1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let values =
+            PrimitiveArray::from_iter([0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.5]);
+        let decoded = runend_decode_primitive(ends, values, 0, 10);
+
+        let mut expected_data = vec![0.0f64; 10];
+        expected_data[9] = 3.5;
+        let expected = PrimitiveArray::from_iter(expected_data);
         assert_arrays_eq!(decoded, expected);
     }
 }
