@@ -202,42 +202,106 @@ pub fn runend_decode_typed_primitive<T: NativePType>(
 ) -> PrimitiveArray {
     match values_validity {
         Mask::AllTrue(_) => {
+            // Pre-allocate buffer capacity, then fill using slice::fill
+            // which the compiler can vectorize more efficiently than per-element writes
             let mut decoded: BufferMut<T> = BufferMut::with_capacity(length);
+            // SAFETY: We will initialize all elements before returning
+            unsafe { decoded.set_len(length) };
+            let decoded_slice = decoded.as_mut_slice();
+            let mut current_pos = 0usize;
+
             for (end, value) in run_ends.zip_eq(values) {
-                assert!(end <= length, "Runend end must be less than overall length");
-                // SAFETY:
-                // We preallocate enough capacity because we know the total length
-                unsafe { decoded.push_n_unchecked(*value, end - decoded.len()) };
+                debug_assert!(
+                    end <= length,
+                    "Runend end must be less than or equal to overall length"
+                );
+                // Skip runs that are entirely before the current position
+                // (can happen with offset when runs end before the view starts)
+                if end > current_pos {
+                    // Use slice::fill which gets vectorized by LLVM
+                    decoded_slice[current_pos..end].fill(*value);
+                    current_pos = end;
+                }
             }
             PrimitiveArray::new(decoded, values_nullability.into())
         }
         Mask::AllFalse(_) => PrimitiveArray::new(Buffer::<T>::zeroed(length), Validity::AllInvalid),
         Mask::Values(mask) => {
-            let mut decoded = BufferMut::with_capacity(length);
+            // For nullable values, we need zeroed buffer for null positions
+            let mut decoded: BufferMut<T> = BufferMut::zeroed(length);
+            let decoded_slice = decoded.as_mut_slice();
             let mut decoded_validity = BitBufferMut::with_capacity(length);
+            let mut current_pos = 0usize;
+
             for (end, value) in run_ends.zip_eq(
                 values
                     .iter()
                     .zip(mask.bit_buffer().iter())
                     .map(|(&v, is_valid)| is_valid.then_some(v)),
             ) {
-                assert!(end <= length, "Runend end must be less than overall length");
-                match value {
-                    None => {
-                        decoded_validity.append_n(false, end - decoded.len());
-                        // SAFETY:
-                        // We preallocate enough capacity because we know the total length
-                        unsafe { decoded.push_n_unchecked(T::default(), end - decoded.len()) };
+                debug_assert!(
+                    end <= length,
+                    "Runend end must be less than or equal to overall length"
+                );
+                // Skip runs that are entirely before the current position
+                if end > current_pos {
+                    let run_len = end - current_pos;
+                    match value {
+                        None => {
+                            decoded_validity.append_n(false, run_len);
+                            // Leave zeroed for null values (already zeroed from BufferMut::zeroed)
+                        }
+                        Some(value) => {
+                            decoded_validity.append_n(true, run_len);
+                            decoded_slice[current_pos..end].fill(value);
+                        }
                     }
-                    Some(value) => {
-                        decoded_validity.append_n(true, end - decoded.len());
-                        // SAFETY:
-                        // We preallocate enough capacity because we know the total length
-                        unsafe { decoded.push_n_unchecked(value, end - decoded.len()) };
-                    }
+                    current_pos = end;
                 }
             }
             PrimitiveArray::new(decoded, Validity::from(decoded_validity.freeze()))
+        }
+    }
+}
+
+/// Fills bits in range [start, end) to true using byte-level operations.
+/// Assumes the buffer is pre-initialized to all zeros.
+#[inline(always)]
+fn fill_bits_true(slice: &mut [u8], start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+
+    let start_byte = start / 8;
+    let start_bit = start % 8;
+    let end_byte = end / 8;
+    let end_bit = end % 8;
+
+    if start_byte == end_byte {
+        // All bits in same byte
+        // Use u16 to avoid overflow, then truncate (guaranteed to fit in u8 since max is 0xFF)
+        #[allow(clippy::cast_possible_truncation)]
+        let mask = ((1u16 << (end_bit - start_bit)) - 1) as u8;
+        slice[start_byte] |= mask << start_bit;
+    } else {
+        // First partial byte
+        if start_bit != 0 {
+            slice[start_byte] |= !((1u8 << start_bit) - 1);
+        }
+
+        // Middle bytes (bulk memset to 0xFF)
+        let fill_start = if start_bit != 0 {
+            start_byte + 1
+        } else {
+            start_byte
+        };
+        if fill_start < end_byte {
+            slice[fill_start..end_byte].fill(0xFF);
+        }
+
+        // Last partial byte
+        if end_bit != 0 {
+            slice[end_byte] |= (1u8 << end_bit) - 1;
         }
     }
 }
@@ -251,9 +315,19 @@ pub fn runend_decode_typed_bool(
 ) -> BoolArray {
     match values_validity {
         Mask::AllTrue(_) => {
-            let mut decoded = BitBufferMut::with_capacity(length);
+            // Pre-allocate buffer with all zeros (false)
+            // Only need to fill the true runs - false runs are already 0
+            let mut decoded = BitBufferMut::new_unset(length);
+            let decoded_bytes = decoded.as_mut_slice();
+            let mut current_pos = 0usize;
+
             for (end, value) in run_ends.zip_eq(values.iter()) {
-                decoded.append_n(value, end - decoded.len());
+                // Skip runs that are entirely before the current position
+                // Only fill when value is true (false is already 0)
+                if end > current_pos && value {
+                    fill_bits_true(decoded_bytes, current_pos, end);
+                }
+                current_pos = end;
             }
             BoolArray::from_bit_buffer(decoded.freeze(), values_nullability.into())
         }
@@ -261,23 +335,35 @@ pub fn runend_decode_typed_bool(
             BoolArray::from_bit_buffer(BitBuffer::new_unset(length), Validity::AllInvalid)
         }
         Mask::Values(mask) => {
-            let mut decoded = BitBufferMut::with_capacity(length);
-            let mut decoded_validity = BitBufferMut::with_capacity(length);
+            // Pre-allocate both buffers with zeros
+            let mut decoded = BitBufferMut::new_unset(length);
+            let mut decoded_validity = BitBufferMut::new_unset(length);
+            let decoded_bytes = decoded.as_mut_slice();
+            let validity_bytes = decoded_validity.as_mut_slice();
+            let mut current_pos = 0usize;
+
             for (end, value) in run_ends.zip_eq(
                 values
                     .iter()
                     .zip(mask.bit_buffer().iter())
                     .map(|(v, is_valid)| is_valid.then_some(v)),
             ) {
-                match value {
-                    None => {
-                        decoded_validity.append_n(false, end - decoded.len());
-                        decoded.append_n(false, end - decoded.len());
+                // Skip runs that are entirely before the current position
+                if end > current_pos {
+                    match value {
+                        None => {
+                            // Validity stays false (already 0), decoded stays false
+                        }
+                        Some(v) => {
+                            // Set validity bits to true
+                            fill_bits_true(validity_bytes, current_pos, end);
+                            // Set decoded bits if value is true
+                            if v {
+                                fill_bits_true(decoded_bytes, current_pos, end);
+                            }
+                        }
                     }
-                    Some(value) => {
-                        decoded_validity.append_n(true, end - decoded.len());
-                        decoded.append_n(value, end - decoded.len());
-                    }
+                    current_pos = end;
                 }
             }
             BoolArray::from_bit_buffer(decoded.freeze(), Validity::from(decoded_validity.freeze()))

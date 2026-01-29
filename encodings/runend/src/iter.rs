@@ -29,7 +29,8 @@ pub fn trimmed_ends_iter<E: IntegerPType>(
     run_ends
         .iter()
         .copied()
-        .map(move |v| v - offset_e)
+        // Use saturating_sub to handle runs that end before the offset
+        .map(move |v| v.saturating_sub(offset_e))
         .map(move |v| min(v, length_e))
         .map(|v| v.as_())
 }

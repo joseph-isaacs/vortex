@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "run_end_compress"
 harness = false
+
+[[bench]]
+name = "run_end_decode"
+harness = false
