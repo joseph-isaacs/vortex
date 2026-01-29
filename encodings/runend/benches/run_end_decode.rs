@@ -14,6 +14,7 @@ use vortex_dtype::NativePType;
 use vortex_runend::compress::runend_decode_bools;
 use vortex_runend::compress::runend_decode_bools_original;
 use vortex_runend::compress::runend_decode_primitive;
+use vortex_runend::compress::runend_decode_primitive_original;
 
 fn main() {
     warm_up_vtables();
@@ -446,6 +447,12 @@ enum PrimitiveDistribution {
     SparseNonZero,
     /// Values follow a pattern that repeats
     Repeating,
+    /// Every run has a unique value (modulo 256)
+    AllDifferent,
+    /// Pseudo-random values using simple LCG
+    Random,
+    /// Groups of N consecutive runs with the same value
+    Clustered(usize),
 }
 
 /// Creates primitive test data with configurable value distribution
@@ -487,6 +494,15 @@ where
                 }
             }
             PrimitiveDistribution::Repeating => <T as From<u8>>::from((run_index % 4) as u8),
+            PrimitiveDistribution::AllDifferent => <T as From<u8>>::from((run_index % 256) as u8),
+            PrimitiveDistribution::Random => {
+                let rand = (run_index.wrapping_mul(1103515245).wrapping_add(12345)) % 256;
+                <T as From<u8>>::from(rand as u8)
+            }
+            PrimitiveDistribution::Clustered(cluster_size) => {
+                let cluster_index = run_index / cluster_size;
+                <T as From<u8>>::from((cluster_index % 256) as u8)
+            }
         };
         values.push(val);
         run_index += 1;
@@ -866,5 +882,373 @@ where
     T: Clone + Default + NativePType + From<u8>,
 {
     let (ends, values) = create_sparse_data::<T>(total_length, num_runs, 10);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// All-different and varied value distribution benchmarks
+// ============================================================================
+// These benchmarks test decoding performance when run values are highly varied,
+// not constant or sparse. This represents real-world scenarios where the data
+// has many unique values.
+
+// Short runs with varied values (high cardinality scenarios)
+// Format: (total_length, avg_run_length)
+const SHORT_RUN_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 16), // ~62,500 runs
+    (1_000_000, 24), // ~41,666 runs
+    (1_000_000, 32), // ~31,250 runs
+];
+
+// Medium runs with varied values
+// Format: (total_length, avg_run_length)
+const MEDIUM_RUN_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 64),  // ~15,625 runs
+    (1_000_000, 100), // ~10,000 runs
+    (1_000_000, 256), // ~3,906 runs
+];
+
+// --- All different value distribution (unique value per run) ---
+
+/// Benchmark with all different values - short runs
+#[divan::bench(types = [u8, u32, u64], args = SHORT_RUN_ARGS)]
+fn decode_primitive_all_different_short<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::AllDifferent,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark with all different values - medium runs
+#[divan::bench(types = [u8, u32, u64], args = MEDIUM_RUN_ARGS)]
+fn decode_primitive_all_different_medium<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::AllDifferent,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Clustered value distribution (groups of N runs with same value) ---
+
+// Clustered benchmark args combining short and medium runs
+const CLUSTERED_ARGS: &[(usize, usize)] = &[
+    // Short runs
+    (1_000_000, 16),
+    (1_000_000, 24),
+    (1_000_000, 32),
+    // Medium runs
+    (1_000_000, 64),
+    (1_000_000, 100),
+    (1_000_000, 256),
+];
+
+/// Benchmark with clustered values - cluster size 4
+/// Each value repeats for 4 consecutive runs before changing
+#[divan::bench(types = [u8, u32, u64], args = CLUSTERED_ARGS)]
+fn decode_primitive_clustered_4<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(4),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark with clustered values - cluster size 8
+/// Each value repeats for 8 consecutive runs before changing
+#[divan::bench(types = [u8, u32, u64], args = CLUSTERED_ARGS)]
+fn decode_primitive_clustered_8<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(8),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark with clustered values - cluster size 16
+/// Each value repeats for 16 consecutive runs before changing
+#[divan::bench(types = [u8, u32, u64], args = CLUSTERED_ARGS)]
+fn decode_primitive_clustered_16<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(16),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Clustered vs Unclustered comparison benchmarks ---
+// These benchmarks compare clustered data (consecutive runs with same value)
+// against unclustered data (every run has a different value) to demonstrate
+// the benefit of the clustered values optimization.
+
+/// Benchmark args for clustered vs unclustered comparison
+const CLUSTERED_COMPARISON_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 16),  // avg run 16, ~62.5K runs
+    (1_000_000, 32),  // avg run 32, ~31.25K runs
+    (1_000_000, 64),  // avg run 64, ~15.6K runs
+    (1_000_000, 128), // avg run 128, ~7.8K runs
+];
+
+/// Baseline: unclustered data - every run has a different value
+#[divan::bench(types = [u32, u64], args = CLUSTERED_COMPARISON_ARGS)]
+fn decode_unclustered_baseline<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::AllDifferent,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Clustered: 4 consecutive runs share the same value
+#[divan::bench(types = [u32, u64], args = CLUSTERED_COMPARISON_ARGS)]
+fn decode_clustered_4_optimized<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(4),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Clustered: 8 consecutive runs share the same value
+#[divan::bench(types = [u32, u64], args = CLUSTERED_COMPARISON_ARGS)]
+fn decode_clustered_8_optimized<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(8),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Clustered: 16 consecutive runs share the same value
+#[divan::bench(types = [u32, u64], args = CLUSTERED_COMPARISON_ARGS)]
+fn decode_clustered_16_optimized<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Clustered(16),
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Random value distribution (pseudo-random LCG values) ---
+
+/// Benchmark with pseudo-random values - short runs
+#[divan::bench(types = [u8, u32, u64], args = SHORT_RUN_ARGS)]
+fn decode_primitive_random_short<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Random,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Benchmark with pseudo-random values - medium runs
+#[divan::bench(types = [u8, u32, u64], args = MEDIUM_RUN_ARGS)]
+fn decode_primitive_random_medium<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Random,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Original vs Optimized primitive decode comparison benchmarks
+// ============================================================================
+// These benchmarks compare the original (simple) implementation against the
+// optimized implementation which uses:
+// - Constant value detection
+// - Sparse zero optimization
+// - Clustered values optimization
+// - Short run fill optimization (fill_short)
+
+/// Benchmark args for short-run comparison: (total_length, avg_run_length)
+/// Focus on the short run case (16-32 elements average) where overhead matters most
+const SHORT_RUN_COMPARISON_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 16), // ~62,500 runs - short runs
+    (1_000_000, 24), // ~41,666 runs
+    (1_000_000, 32), // ~31,250 runs
+    (1_000_000, 64), // ~15,625 runs - medium runs for comparison
+];
+
+// --- Original implementation benchmarks for short runs ---
+
+/// Original implementation: short runs with all different values
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn original_primitive_all_different<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::AllDifferent,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Optimized implementation: short runs with all different values
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn optimized_primitive_all_different<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::AllDifferent,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation: sequential values (0, 1, 2, 3, ...)
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn original_primitive_sequential<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Sequential,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Optimized implementation: sequential values (0, 1, 2, 3, ...)
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn optimized_primitive_sequential<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Sequential,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation: constant values (all 42)
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn original_primitive_constant<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Constant,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Optimized implementation: constant values (all 42) - should use fast path
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn optimized_primitive_constant<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Constant,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation: sparse data (90% zeros)
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn original_primitive_sparse<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::SparseNonZero,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Optimized implementation: sparse data (90% zeros) - should use zeroed buffer optimization
+#[divan::bench(types = [u32, u64], args = SHORT_RUN_COMPARISON_ARGS)]
+fn optimized_primitive_sparse<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::SparseNonZero,
+    );
     bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
 }
