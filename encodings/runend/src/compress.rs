@@ -25,6 +25,42 @@ use vortex_scalar::Scalar;
 
 use crate::iter::trimmed_ends_iter;
 
+// ============================================================================
+// Original implementation (for benchmarking comparison)
+// ============================================================================
+
+/// Original bool decode implementation using append_n for each run.
+/// Kept for benchmarking comparison with the optimized version.
+pub fn runend_decode_typed_bool_original(
+    run_ends: impl Iterator<Item = usize>,
+    values: &BitBuffer,
+    length: usize,
+) -> BoolArray {
+    let mut decoded = BitBufferMut::with_capacity(length);
+    for (end, value) in run_ends.zip_eq(values.iter()) {
+        if end > decoded.len() {
+            decoded.append_n(value, end - decoded.len());
+        }
+    }
+    BoolArray::from_bit_buffer(decoded.freeze(), Validity::NonNullable)
+}
+
+/// Public wrapper for benchmarking the original bool decode
+pub fn runend_decode_bools_original(
+    ends: PrimitiveArray,
+    values: BoolArray,
+    offset: usize,
+    length: usize,
+) -> BoolArray {
+    match_each_unsigned_integer_ptype!(ends.ptype(), |E| {
+        runend_decode_typed_bool_original(
+            trimmed_ends_iter(ends.as_slice::<E>(), offset, length),
+            values.bit_buffer(),
+            length,
+        )
+    })
+}
+
 /// Run-end encode a `PrimitiveArray`, returning a tuple of `(ends, values)`.
 pub fn runend_encode(array: &PrimitiveArray) -> (PrimitiveArray, ArrayRef) {
     let validity = match array.validity() {
