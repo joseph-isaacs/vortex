@@ -320,3 +320,96 @@ unsafe fn fill_u8_avx2(slice: &mut [u8], value: u8) {
 3. **Specialized paths for extreme cases** (non-temporal for huge fills)
 
 Focus on correctness and maintainability first. Only add complex optimizations when benchmarks prove significant gains.
+
+## Type-Specific Optimization Research
+
+### u64 Optimizations (8-byte integers)
+
+**Key findings**:
+- LLVM auto-vectorizes `slice::fill` effectively with AVX2 (4 u64s per 256-bit register)
+- Memory bandwidth is the bottleneck for long runs (>1024 elements)
+- Per-run overhead is the bottleneck for short runs (8-64 elements)
+
+**Recommendations**:
+| Priority | Optimization | Expected Gain | Notes |
+|----------|--------------|---------------|-------|
+| 1 | Sparse zero detection | 20-50% | Use `BufferMut::zeroed()` + skip zero fills |
+| 2 | Non-temporal stores | 20-40% | Only for runs >1024 elements (8KB) |
+| 3 | Aligned allocation | 0-5% | Use `Alignment::new(64)` for cache lines |
+| Low | Manual SIMD | ~5% | **Not recommended** - LLVM already handles this |
+
+### f64 Optimizations (8-byte floats)
+
+**Key findings**:
+- Prefer integer SIMD (treat f64 as u64 bits) over FP SIMD
+- No special handling needed for NaN, Inf, or denormal values
+- Codebase pattern: `/home/user/vortex/vortex-compute/src/take/slice/avx2.rs` treats f64 as u64
+
+**Recommendations**:
+| Priority | Optimization | Expected Gain | Notes |
+|----------|--------------|---------------|-------|
+| 1 | Sparse zero detection | 20-40% | Same as u64, use integer comparison |
+| 2 | Integer SIMD (if explicit) | 5-15% | `_mm256_set1_epi64x` + `to_bits()` |
+| Low | FP SIMD | ~5% | No benefit over integer approach |
+| None | Special value detection | 0% | Not needed - no performance impact |
+
+### i128/Decimal Optimizations (16-byte integers)
+
+**Key findings**:
+- Only 2 i128s fit in AVX2 (256-bit), 4 in AVX-512
+- Cache line = 64 bytes = 4 i128s
+- LLVM auto-vectorization is already good
+
+**Recommendations**:
+| Priority | Optimization | Expected Gain | Notes |
+|----------|--------------|---------------|-------|
+| 1 | Sparse zero detection | 20-50% | Highest ROI for decimal columns |
+| 2 | Constant detection | 10-30% | Common in decimal columns |
+| 3 | Cache-line processing | 5-10% | Process 4 i128s (64 bytes) at a time |
+| Low | Explicit AVX-512 | 10-20% | Only if benchmarks justify |
+
+### AVX-512 Masked Operations
+
+**Key findings**:
+- Masked stores can eliminate scalar remainder loops
+- Benefit proportional to run boundary frequency
+- Best for short runs (avg 8-64 elements)
+- Overlapping stores are simpler alternative to masking
+
+**When AVX-512 masking is worth it**:
+- Target is Intel server CPUs (Skylake-X+)
+- Workloads have many short runs (avg <64 elements)
+- Run-end decode is a profiled bottleneck
+
+**When to skip AVX-512**:
+- Portability important (ARM, WASM)
+- LLVM auto-vectorization sufficient
+- Typical workloads have long runs (avg >1000)
+
+### ARM SVE (Scalable Vector Extension)
+
+**Key findings**:
+- Vector length agnostic (128-2048 bits, hardware determines)
+- Predicate registers eliminate remainder loops
+- `svwhilelt_b64(start, end)` creates partial vector mask
+- Good for Graviton3/4 deployment
+
+```rust
+// SVE pseudocode (nightly only)
+let pred = svptrue_b64();           // All lanes active
+let broadcast = svdup_n_u64(value); // Broadcast to all lanes
+svst1_u64(pred, ptr, broadcast);    // Store with predicate
+```
+
+## Summary: Optimization Priorities
+
+| Rank | Optimization | Types | Gain | Complexity | Recommended |
+|------|--------------|-------|------|------------|-------------|
+| 1 | **Sparse zero detection** | All | 20-50% | Low | **Yes** |
+| 2 | **Constant value detection** | All | 10-30% | Low | **Yes** |
+| 3 | Run length classification | All | 15-40% | Medium | For short runs |
+| 4 | Non-temporal stores | u64+ | 20-40% | Medium | For >1MB fills |
+| 5 | AVX-512 masking | All | 5-15% | High | Only if justified |
+| 6 | Explicit SIMD | u8 | 10-30% | High | Rarely |
+
+**Bottom line**: LLVM's auto-vectorization is excellent. Focus on **avoiding unnecessary work** (sparse zeros, constant values) rather than micro-optimizing the fill operation itself.
