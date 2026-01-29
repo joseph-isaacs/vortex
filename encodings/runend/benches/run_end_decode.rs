@@ -426,3 +426,256 @@ fn optimized_bool_all_false(bencher: Bencher, (total_length, avg_run_length): (u
     );
     bencher.bench(|| runend_decode_bools(ends.clone(), values.clone(), 0, total_length));
 }
+
+// ============================================================================
+// Primitive decode benchmarks with different value distributions
+// ============================================================================
+// Note: Run-end encoding is typically chosen when avg run length > 8
+// These benchmarks focus on realistic scenarios
+
+/// Value distribution types for primitive benchmarks
+#[derive(Clone, Copy)]
+enum PrimitiveDistribution {
+    /// All runs have the same constant value (e.g., all zeros)
+    Constant,
+    /// Values increment sequentially (0, 1, 2, 3, ...)
+    Sequential,
+    /// Values alternate between 0 and a large value
+    Binary,
+    /// Mostly zeros with occasional non-zero (10% non-zero)
+    SparseNonZero,
+    /// Values follow a pattern that repeats
+    Repeating,
+}
+
+/// Creates primitive test data with configurable value distribution
+fn create_primitive_test_data_with_distribution<T>(
+    total_length: usize,
+    avg_run_length: usize,
+    distribution: PrimitiveDistribution,
+) -> (PrimitiveArray, PrimitiveArray)
+where
+    T: Clone + Default + NativePType,
+    T: From<u8>,
+{
+    let mut ends = BufferMut::<u32>::with_capacity(total_length / avg_run_length + 1);
+    let mut values = BufferMut::<T>::with_capacity(total_length / avg_run_length + 1);
+
+    let mut pos = 0usize;
+    let mut run_index = 0usize;
+
+    while pos < total_length {
+        let run_len = avg_run_length.min(total_length - pos);
+        pos += run_len;
+        ends.push(pos as u32);
+
+        let val: T = match distribution {
+            PrimitiveDistribution::Constant => <T as From<u8>>::from(42u8),
+            PrimitiveDistribution::Sequential => <T as From<u8>>::from((run_index % 256) as u8),
+            PrimitiveDistribution::Binary => {
+                if run_index % 2 == 0 {
+                    <T as From<u8>>::from(0u8)
+                } else {
+                    <T as From<u8>>::from(255u8)
+                }
+            }
+            PrimitiveDistribution::SparseNonZero => {
+                if run_index % 10 == 0 {
+                    <T as From<u8>>::from(((run_index / 10) % 256) as u8)
+                } else {
+                    <T as From<u8>>::from(0u8)
+                }
+            }
+            PrimitiveDistribution::Repeating => <T as From<u8>>::from((run_index % 4) as u8),
+        };
+        values.push(val);
+        run_index += 1;
+    }
+
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), Validity::NonNullable),
+    )
+}
+
+// Benchmark args for realistic run-end scenarios (avg run len >= 8)
+// Format: (total_length, avg_run_length)
+const PRIMITIVE_DIST_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 8),     // Minimum practical for run-end
+    (1_000_000, 16),    // Short runs
+    (1_000_000, 64),    // Medium runs
+    (1_000_000, 256),   // Long runs
+    (1_000_000, 1024),  // Very long runs
+    (1_000_000, 10000), // Extremely long runs
+];
+
+// --- Constant value distribution ---
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_DIST_ARGS)]
+fn decode_primitive_constant<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Constant,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Sequential value distribution ---
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_DIST_ARGS)]
+fn decode_primitive_sequential<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Sequential,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Binary value distribution (0 and max alternating) ---
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_DIST_ARGS)]
+fn decode_primitive_binary<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Binary,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Sparse non-zero distribution (90% zeros) ---
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_DIST_ARGS)]
+fn decode_primitive_sparse<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::SparseNonZero,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Repeating pattern distribution ---
+
+#[divan::bench(types = [u8, u32, u64], args = PRIMITIVE_DIST_ARGS)]
+fn decode_primitive_repeating<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Repeating,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Large array benchmarks (testing memory bandwidth limits)
+// ============================================================================
+
+const LARGE_ARRAY_ARGS: &[(usize, usize)] = &[
+    (10_000_000, 100),   // 10M elements, medium runs
+    (10_000_000, 1000),  // 10M elements, long runs
+    (10_000_000, 10000), // 10M elements, very long runs
+];
+
+#[divan::bench(types = [u32, u64], args = LARGE_ARRAY_ARGS)]
+fn decode_primitive_large<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Sequential,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            total_length * size_of::<T>(),
+        ))
+        .bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+#[divan::bench(args = LARGE_ARRAY_ARGS)]
+fn decode_bool_large(bencher: Bencher, (total_length, avg_run_length): (usize, usize)) {
+    let (ends, values) = create_bool_test_data_with_distribution(
+        total_length,
+        avg_run_length,
+        BoolDistribution::Alternating,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(total_length / 8))
+        .bench(|| runend_decode_bools(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Variable run length benchmarks (simulating real-world irregular patterns)
+// ============================================================================
+
+/// Creates test data with variable run lengths (not uniform)
+fn create_variable_run_data<T>(
+    total_length: usize,
+    avg_run_length: usize,
+) -> (PrimitiveArray, PrimitiveArray)
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let mut ends = BufferMut::<u32>::with_capacity(total_length / avg_run_length + 1);
+    let mut values = BufferMut::<T>::with_capacity(total_length / avg_run_length + 1);
+
+    let mut pos = 0usize;
+    let mut run_index = 0usize;
+
+    // Use a simple pseudo-random pattern for variable run lengths
+    // Pattern: short, medium, long, very long, repeat
+    let run_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0];
+
+    while pos < total_length {
+        let multiplier = run_multipliers[run_index % run_multipliers.len()];
+        let run_len = ((avg_run_length as f64 * multiplier) as usize)
+            .max(1)
+            .min(total_length - pos);
+        pos += run_len;
+        ends.push(pos as u32);
+        values.push(<T as From<u8>>::from((run_index % 256) as u8));
+        run_index += 1;
+    }
+
+    (
+        PrimitiveArray::new(ends.freeze(), Validity::NonNullable),
+        PrimitiveArray::new(values.freeze(), Validity::NonNullable),
+    )
+}
+
+const VARIABLE_RUN_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 16),   // Avg 16, actual varies 4-64
+    (1_000_000, 64),   // Avg 64, actual varies 16-256
+    (1_000_000, 256),  // Avg 256, actual varies 64-1024
+    (1_000_000, 1024), // Avg 1024, actual varies 256-4096
+];
+
+#[divan::bench(types = [u32, u64], args = VARIABLE_RUN_ARGS)]
+fn decode_primitive_variable_runs<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_variable_run_data::<T>(total_length, avg_run_length);
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
