@@ -453,6 +453,19 @@ enum PrimitiveDistribution {
     Random,
     /// Groups of N consecutive runs with the same value
     Clustered(usize),
+    /// Zipf/Power-law: Few values appear very frequently, many values appear rarely
+    /// Simulates real-world frequency distributions (word frequencies, city populations, etc.)
+    Zipf,
+    /// Temporal/Monotonic: Values that trend upward (timestamps, counters)
+    /// Slowly increasing values with occasional repeats
+    Monotonic,
+    /// Categorical with skew: Few categories with uneven distribution
+    /// 5 categories with frequencies: 50%, 25%, 15%, 7%, 3%
+    /// Simulates status flags, country codes, error types, etc.
+    CategoricalSkewed,
+    /// Dictionary-like: Small set of values that repeat in pseudo-random order
+    /// Values 0-15 repeating (like dictionary indices for string columns)
+    Dictionary,
 }
 
 /// Creates primitive test data with configurable value distribution
@@ -502,6 +515,40 @@ where
             PrimitiveDistribution::Clustered(cluster_size) => {
                 let cluster_index = run_index / cluster_size;
                 <T as From<u8>>::from((cluster_index % 256) as u8)
+            }
+            PrimitiveDistribution::Zipf => {
+                // Zipf distribution approximation: value = floor(100 / rank)
+                // Most runs have value 0 or 1, few have higher values
+                // rank goes from 1 to 100, cycling
+                let rank = (run_index % 100) + 1;
+                <T as From<u8>>::from((100 / rank).min(255) as u8)
+            }
+            PrimitiveDistribution::Monotonic => {
+                // Slowly increasing values with occasional repeats
+                // Every 4 runs, the value increases by 1
+                <T as From<u8>>::from(((run_index / 4) % 256) as u8)
+            }
+            PrimitiveDistribution::CategoricalSkewed => {
+                // 5 categories with frequencies: 50%, 25%, 15%, 7%, 3%
+                let r = run_index % 100;
+                let val = if r < 50 {
+                    0
+                } else if r < 75 {
+                    1
+                } else if r < 90 {
+                    2
+                } else if r < 97 {
+                    3
+                } else {
+                    4
+                };
+                <T as From<u8>>::from(val)
+            }
+            PrimitiveDistribution::Dictionary => {
+                // Values 0-15 repeating in pseudo-random order
+                // Uses multiplicative hash to get 0-15
+                let hash = run_index.wrapping_mul(2654435761) >> 28; // Simple hash to 0-15
+                <T as From<u8>>::from(hash as u8)
             }
         };
         values.push(val);
@@ -1251,4 +1298,247 @@ where
         PrimitiveDistribution::SparseNonZero,
     );
     bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Real-world distribution benchmarks
+// ============================================================================
+// These benchmarks simulate realistic data patterns commonly found in production:
+// - Zipf/Power-law: Word frequencies, city populations, web page popularity
+// - Monotonic: Timestamps, counters, auto-increment IDs
+// - CategoricalSkewed: Status codes, country codes, error types
+// - Dictionary: Dictionary-encoded string column indices
+
+/// Realistic benchmark args: run-end encoding is chosen when avg run >= 8
+/// Format: (total_length, avg_run_length)
+const REALISTIC_ARGS: &[(usize, usize)] = &[
+    (1_000_000, 8),   // Minimum practical for run-end encoding
+    (1_000_000, 32),  // Common case in production
+    (1_000_000, 128), // Longer runs (highly repetitive data)
+];
+
+// --- Zipf/Power-law distribution benchmarks ---
+// Simulates frequency distributions where few values dominate:
+// - Word frequencies in text (Zipf's law)
+// - City populations
+// - Website traffic patterns
+
+#[divan::bench(types = [u8, u32, u64], args = REALISTIC_ARGS)]
+fn decode_primitive_zipf<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Zipf,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation for Zipf comparison
+#[divan::bench(types = [u32, u64], args = REALISTIC_ARGS)]
+fn original_primitive_zipf<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Zipf,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Monotonic/Temporal distribution benchmarks ---
+// Simulates data that trends upward over time:
+// - Timestamps
+// - Auto-increment counters
+// - Sequence numbers
+
+#[divan::bench(types = [u8, u32, u64], args = REALISTIC_ARGS)]
+fn decode_primitive_monotonic<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Monotonic,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation for Monotonic comparison
+#[divan::bench(types = [u32, u64], args = REALISTIC_ARGS)]
+fn original_primitive_monotonic<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Monotonic,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Categorical with skew distribution benchmarks ---
+// Simulates categorical data with uneven frequency distribution:
+// - Status codes (mostly "OK", few errors)
+// - Country codes (few countries dominate traffic)
+// - Error types (most operations succeed)
+// 5 categories with frequencies: 50%, 25%, 15%, 7%, 3%
+
+#[divan::bench(types = [u8, u32, u64], args = REALISTIC_ARGS)]
+fn decode_primitive_categorical_skewed<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::CategoricalSkewed,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation for CategoricalSkewed comparison
+#[divan::bench(types = [u32, u64], args = REALISTIC_ARGS)]
+fn original_primitive_categorical_skewed<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::CategoricalSkewed,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+// --- Dictionary-like distribution benchmarks ---
+// Simulates dictionary-encoded data patterns:
+// - Dictionary indices for string columns
+// - Enum values
+// - Small cardinality dimension keys
+// Values 0-15 repeating in pseudo-random order
+
+#[divan::bench(types = [u8, u32, u64], args = REALISTIC_ARGS)]
+fn decode_primitive_dictionary<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Dictionary,
+    );
+    bencher.bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+/// Original implementation for Dictionary comparison
+#[divan::bench(types = [u32, u64], args = REALISTIC_ARGS)]
+fn original_primitive_dictionary<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Dictionary,
+    );
+    bencher
+        .bench(|| runend_decode_primitive_original(ends.clone(), values.clone(), 0, total_length));
+}
+
+// ============================================================================
+// Real-world throughput benchmarks
+// ============================================================================
+// Measure raw throughput for realistic distributions at scale
+
+/// Realistic throughput args: larger arrays to measure memory bandwidth
+const REALISTIC_THROUGHPUT_ARGS: &[(usize, usize)] = &[
+    (10_000_000, 8),   // 10M elements, minimum practical runs
+    (10_000_000, 32),  // 10M elements, common case
+    (10_000_000, 128), // 10M elements, longer runs
+];
+
+#[divan::bench(types = [u32, u64], args = REALISTIC_THROUGHPUT_ARGS)]
+fn decode_zipf_throughput<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Zipf,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            total_length * size_of::<T>(),
+        ))
+        .bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+#[divan::bench(types = [u32, u64], args = REALISTIC_THROUGHPUT_ARGS)]
+fn decode_monotonic_throughput<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Monotonic,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            total_length * size_of::<T>(),
+        ))
+        .bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+#[divan::bench(types = [u32, u64], args = REALISTIC_THROUGHPUT_ARGS)]
+fn decode_categorical_skewed_throughput<T>(
+    bencher: Bencher,
+    (total_length, avg_run_length): (usize, usize),
+) where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::CategoricalSkewed,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            total_length * size_of::<T>(),
+        ))
+        .bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
+}
+
+#[divan::bench(types = [u32, u64], args = REALISTIC_THROUGHPUT_ARGS)]
+fn decode_dictionary_throughput<T>(bencher: Bencher, (total_length, avg_run_length): (usize, usize))
+where
+    T: Clone + Default + NativePType + From<u8>,
+{
+    let (ends, values) = create_primitive_test_data_with_distribution::<T>(
+        total_length,
+        avg_run_length,
+        PrimitiveDistribution::Dictionary,
+    );
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            total_length * size_of::<T>(),
+        ))
+        .bench(|| runend_decode_primitive(ends.clone(), values.clone(), 0, total_length));
 }
